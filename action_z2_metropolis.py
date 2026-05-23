@@ -103,6 +103,7 @@ def heatbath_sweep(
     K: float = 1.0, K_E: float = None, K_M: float = None,
     rng: np.random.Generator = None,
     action_type: str = 'forward',
+    strang_M: bool = False,
 ) -> tuple[Z2GaugeConfig, float, float, int]:
     """Per-link Z_2 heat-bath sweep.  100% acceptance: each link is sampled
     from its exact conditional P(U_l | others) ∝ exp(-S_g(U_l)) · |det M(U_l)|.
@@ -122,13 +123,13 @@ def heatbath_sweep(
     rng.shuffle(links)
     n_flipped = 0
     cur_det = det_fn(geom, U)
-    cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M)
+    cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
     for link_type, t, x, y in links:
         det_cur = cur_det
         Sg_cur = cur_Sg
         flip_link(U, link_type, t, x, y)
         det_flip = det_fn(geom, U)
-        Sg_flip = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M)
+        Sg_flip = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
         # Compute conditional probability of FLIPPED state
         # ratio = (e^{-Sg_flip} |det_flip|) / (e^{-Sg_cur} |det_cur|)
         log_w_flip = -Sg_flip + (np.log(abs(det_flip)) if abs(det_flip) > 0 else -np.inf)
@@ -151,6 +152,7 @@ def plaquette_flip_sweep(
     K: float = 1.0, K_E: float = None, K_M: float = None,
     rng: np.random.Generator = None,
     action_type: str = 'forward',
+    strang_M: bool = False,
 ) -> tuple[Z2GaugeConfig, float, float, int]:
     """Composite Metropolis move: flip all 4 links of a randomly-chosen
     plaquette simultaneously.  The plaquette itself is unchanged (sign(P)
@@ -172,7 +174,7 @@ def plaquette_flip_sweep(
     n_yt_plaqs = max(0, N_E - 1) * Lx * max(0, Ly - 1)
     n_plaqs_total = n_xy_plaqs + n_xt_plaqs + n_yt_plaqs
     if n_plaqs_total == 0:
-        return U, det_fn(geom, U), gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M), 0
+        return U, det_fn(geom, U), gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M), 0
 
     def flip_xy(t, x, y):
         U.U_x[t, x, y] *= -1
@@ -194,7 +196,7 @@ def plaquette_flip_sweep(
 
     n_accept = 0
     cur_det = det_fn(geom, U)
-    cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M)
+    cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
     # one pass: attempt all plaquettes once each
     plaq_list = []
     for t in range(N_E):
@@ -215,7 +217,7 @@ def plaquette_flip_sweep(
         flipper = {'xy': flip_xy, 'xt': flip_xt, 'yt': flip_yt}[ptype]
         flipper(t, x, y)
         new_det = det_fn(geom, U)
-        new_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M)
+        new_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
         log_w_new = -new_Sg + (np.log(abs(new_det)) if abs(new_det) > 0 else -np.inf)
         log_w_cur = -cur_Sg + (np.log(abs(cur_det)) if abs(cur_det) > 0 else -np.inf)
         log_r = log_w_new - log_w_cur
@@ -233,6 +235,7 @@ def metropolis_sweep(
     K: float = 1.0, K_E: float = None, K_M: float = None,
     rng: np.random.Generator = None,
     action_type: str = 'forward',
+    strang_M: bool = False,
 ) -> tuple[Z2GaugeConfig, float, float, int]:
     """One Metropolis sweep over all links in random order. Returns updated U,
     final det M, final S_g, and number of accepts.
@@ -250,11 +253,11 @@ def metropolis_sweep(
     rng.shuffle(links)
     n_accept = 0
     cur_det = det_fn(geom, U)
-    cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M)
+    cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
     for link_type, t, x, y in links:
         flip_link(U, link_type, t, x, y)
         new_det = det_fn(geom, U)
-        new_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M)
+        new_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
         # Use |det M| in the weight; the sign is recorded for reweighting.
         if abs(cur_det) > 0:
             abs_det_ratio = abs(new_det) / abs(cur_det)
@@ -281,6 +284,7 @@ def run_metropolis(
     cold_start: bool = False,
     action_type: str = 'forward',
     plaq_flip_every: int = 0,
+    strang_M: bool = False,
 ) -> MCMCResult:
     """Run Z₂ link Metropolis MC, recording config + observables.
 
@@ -315,7 +319,8 @@ def run_metropolis(
     det_fn = _resolve_det_fn(action_type)
     for sweep in range(n_warmup + n_sweeps):
         U, det_M, S_g, n_acc = heatbath_sweep(
-            geom, U, K=K, K_E=K_E, K_M=K_M, rng=rng, action_type=action_type)
+            geom, U, K=K, K_E=K_E, K_M=K_M, rng=rng, action_type=action_type,
+            strang_M=strang_M)
         n_accept_total += n_acc
         n_attempt_total += n_links_per_sweep
         # Optional composite move: plaquette-flip Metropolis every K sweeps.
@@ -325,7 +330,7 @@ def run_metropolis(
         if plaq_flip_every > 0 and (sweep + 1) % plaq_flip_every == 0:
             U, det_M, S_g, _ = plaquette_flip_sweep(
                 geom, U, K=K, K_E=K_E, K_M=K_M, rng=rng,
-                action_type=action_type)
+                action_type=action_type, strang_M=strang_M)
         if sweep >= n_warmup and (sweep - n_warmup) % record_every == 0:
             U_copy = Z2GaugeConfig(
                 geom=geom,
@@ -359,7 +364,7 @@ def _chain_worker(args):
     inside the worker rather than charged to the chain timer.
     """
     (geom_args, K, K_E, K_M, n_sweeps, n_warmup, seed,
-     record_every, cold_start, action_type, plaq_flip_every) = args
+     record_every, cold_start, action_type, plaq_flip_every, strang_M) = args
     # Pin BLAS in worker — net positive at small matrix sizes (V_4 ≤ ~50).
     try:
         from threadpoolctl import threadpool_limits
@@ -379,11 +384,13 @@ def _chain_worker(args):
                 n_sweeps=n_sweeps, n_warmup=n_warmup,
                 seed=seed, record_every=record_every, cold_start=cold_start,
                 action_type=action_type, plaq_flip_every=plaq_flip_every,
+                strang_M=strang_M,
             )
     return run_metropolis(
         geom, K=K, K_E=K_E, K_M=K_M, n_sweeps=n_sweeps, n_warmup=n_warmup,
         seed=seed, record_every=record_every, cold_start=cold_start,
         action_type=action_type, plaq_flip_every=plaq_flip_every,
+        strang_M=strang_M,
     )
 
 
@@ -398,6 +405,7 @@ def run_metropolis_parallel(
     cold_start: bool = False,
     action_type: str = 'forward',
     plaq_flip_every: int = 0,
+    strang_M: bool = False,
 ) -> MCMCResult:
     """Run K independent MC chains in parallel processes and concatenate
     their recorded configs into a single MCMCResult.
@@ -418,7 +426,7 @@ def run_metropolis_parallel(
     args_list = [
         (geom_args, K, K_E, K_M, n_sweeps_per_chain, n_warmup,
          seed + chain_idx, record_every, cold_start, action_type,
-         plaq_flip_every)
+         plaq_flip_every, strang_M)
         for chain_idx in range(n_chains)
     ]
     t0 = time.time()

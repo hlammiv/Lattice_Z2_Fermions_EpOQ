@@ -92,7 +92,7 @@ def _replica_advance_worker(args):
     """
     (geom_args, U_state, K_E, K_M, n_sweeps,
      rng_state, action_type, plaq_flip_every,
-     record, record_every) = args
+     record, record_every, strang_M) = args
 
     # Pin BLAS to 1 thread and warm up Numba (same pattern as
     # `_chain_worker` in `action_z2_metropolis.py`).
@@ -120,17 +120,17 @@ def _replica_advance_worker(args):
     configs, det_M_hist, S_g_hist, sign_hist, P_E_hist = [], [], [], [], []
 
     last_det = det_fn(geom, U)
-    last_Sg = gauge_action(geom, U, K=0.0, K_E=K_E, K_M=K_M)
+    last_Sg = gauge_action(geom, U, K=0.0, K_E=K_E, K_M=K_M, strang_M=strang_M)
 
     for sweep in range(n_sweeps):
         U, last_det, last_Sg, _n_acc = heatbath_sweep(
             geom, U, K=0.0, K_E=K_E, K_M=K_M, rng=rng,
-            action_type=action_type,
+            action_type=action_type, strang_M=strang_M,
         )
         if plaq_flip_every > 0 and (sweep + 1) % plaq_flip_every == 0:
             U, last_det, last_Sg, _ = plaquette_flip_sweep(
                 geom, U, K=0.0, K_E=K_E, K_M=K_M, rng=rng,
-                action_type=action_type,
+                action_type=action_type, strang_M=strang_M,
             )
         if record and (sweep % record_every == 0):
             configs.append(Z2GaugeConfig(
@@ -183,6 +183,7 @@ def run_metropolis_pt(
     cold_start: bool = False,
     n_workers: int | None = None,
     verbose: bool = False,
+    strang_M: bool = False,
 ) -> Tuple[List[MCMCResult], PTSwapStats]:
     """Run parallel-tempered Z_2 heat-bath MC across the K_E ladder.
 
@@ -252,7 +253,7 @@ def run_metropolis_pt(
                  this_block_sweeps,
                  rng_states[i],
                  action_type, plaq_flip_every,
-                 recording, record_every)
+                 recording, record_every, strang_M)
                 for i in range(N)
             ]
             block_out = pool.map(_replica_advance_worker, args_list)
@@ -397,7 +398,7 @@ def verify_pt(
     args_list = [
         (geom_args, 0.0, K_E_target, K_M,
          n_sweeps, n_warmup, seed + 13 * (i + 1),
-         1, False, action_type, plaq_flip_every)
+         1, False, action_type, plaq_flip_every, False)
         for i in range(n_chains)
     ]
     with mp.Pool(processes=min(n_chains, 16)) as pool:

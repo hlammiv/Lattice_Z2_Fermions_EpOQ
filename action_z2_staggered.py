@@ -123,7 +123,8 @@ class Z2GaugeConfig:
 
 
 def gauge_action(geom: LatticeGeometry, U: Z2GaugeConfig,
-                 K: float = 1.0, K_E: float = None, K_M: float = None) -> float:
+                 K: float = 1.0, K_E: float = None, K_M: float = None,
+                 strang_M: bool = False) -> float:
     """Wilson plaquette action S_g = −K Σ_plaquettes ∏_link σ_link.
 
     For 2+1d Z₂ OBC lattice, plaquettes are:
@@ -135,6 +136,10 @@ def gauge_action(geom: LatticeGeometry, U: Z2GaugeConfig,
     If K_E and K_M are provided separately, the electric and magnetic plaquette
     couplings are independent (matching z2_setup g_e=1.0, g_m=0.5).  Otherwise
     fall back to single K for all plaquettes.
+
+    strang_M=True: doubled-lattice Strang convention — K_M only at odd slices
+    (intermediate gauge states where T_F is applied).  Caller should pass
+    K_E_half = −(1/2)·log tanh((a_τ/2)·g_E) and K_M_full = a_τ·g_M.
     """
     if K_E is None:
         K_E = K
@@ -145,6 +150,7 @@ def gauge_action(geom: LatticeGeometry, U: Z2GaugeConfig,
         U.U_x.astype(np.float64),
         U.U_y.astype(np.float64),
         U.U_t.astype(np.float64),
+        strang_M,
     ))
 
 

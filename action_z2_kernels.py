@@ -142,11 +142,21 @@ def compute_det_M_forward_kernel(Lx: int, Ly: int, N_E: int, m: float,
 def gauge_action_kernel(Lx: int, Ly: int, N_E: int,
                         K_E: float, K_M: float,
                         U_x: np.ndarray, U_y: np.ndarray,
-                        U_t: np.ndarray) -> float:
-    """S_g = -K_M · Σ_xy plaq - K_E · Σ_xτ plaq - K_E · Σ_yτ plaq."""
+                        U_t: np.ndarray,
+                        strang_M: bool = False) -> float:
+    """S_g = -K_M · Σ_xy plaq - K_E · Σ_xτ plaq - K_E · Σ_yτ plaq.
+
+    strang_M=False (default, Lie-Trotter): K_M applied at every slice.
+    strang_M=True (Strang gauge-fermion splitting): K_M applied only at ODD slices.
+        The doubled-lattice convention has 2N_E_orig − 1 slices; odd slices
+        are intermediate (T_F applied), even slices are junctions.  H_M acts
+        once per Strang step at the intermediate gauge eigenstate.
+    """
     total_E = 0.0
     total_M = 0.0
     for t in range(N_E):
+        if strang_M and (t % 2 == 0):
+            continue
         for x in range(Lx - 1):
             for y in range(Ly - 1):
                 u1 = U_x[t, x, y]

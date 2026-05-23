@@ -220,6 +220,8 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
                                     g_hop: float = 0.5,
                                     m_obs: float = None,
                                     order: int = 1,
+                                    strang: bool = False,
+                                    a_tau_F: float = None,
                                     ) -> tuple[np.ndarray, dict]:
     """Combined weight matrix W[Ψ_top, Ψ_bot] = ⟨Ψ_top | T̂_F^{N_E-1} | Ψ_bot⟩
     in lex Fock basis (basis of `fock_basis_labels(V_3)`).
@@ -238,6 +240,16 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
         W = B† @ B   ⇒   diagonal W[ψ,ψ] = ‖B|ψ⟩‖² ≥ 0 always.
         Total Euclidean time still β = (N_E−1)·a_τ.  See
         memory/feedback_W_matrix_nonhermitian.md for the motivation.
+
+    `strang` mode (Phase 35) implements Strang splitting between H_g and H_F:
+      e^{-a_τH_QC} ≈ e^{-(a_τ/2)H_g} · e^{-a_τH_F[U_op]} · e^{-(a_τ/2)H_g}
+      The caller MUST set up the geometry with N_E = 2*N_E_orig - 1 (doubled
+      lattice, ODD count) and use K_E_half = -(1/2)·log tanh((a_τ/2)·g_E)
+      and K_M_full = a_τ·g_M in the gauge MC with `strang_M=True`.  Then:
+        - Gauge sampled on the doubled lattice (half-step transitions)
+        - T_F is applied ONLY at ODD slices (intermediate gauge states) with
+          full-step a_tau_F (= a_τ_user; pass via a_tau_F or it defaults to 2*a_tau)
+        - Boundary gauge states at slices 0 and N_E-1 (both EVEN)
 
     U_t links do NOT enter for fixed gauge eigenstates per slice — they'd
     appear only through electric K_E·X_l terms (which we dropped) or
@@ -258,7 +270,31 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
     # as a_τ · m_Ham but observable mass stays at m_Ham.
     m = m_obs if m_obs is not None else geom.m
 
-    if order == 1:
+    if strang:
+        # Strang: T_F applied at ODD slices only (intermediate gauge states),
+        # with full-step a_tau_F.  Boundary gauge states at slices 0 and N_E-1.
+        if N_E % 2 == 0:
+            raise ValueError(
+                f"strang=True requires odd N_E (doubled lattice), got N_E={N_E}")
+        a_F = a_tau_F if a_tau_F is not None else (2.0 * a_tau)
+        if order == 1:
+            W = np.eye(dim, dtype=complex)
+            for t in range(1, N_E - 1, 2):  # odd slices: 1, 3, ..., N_E-2
+                T_t = build_T_F_trotter(
+                    geom, U.U_x[t, :, :], U.U_y[t, :, :],
+                    a_tau=a_F, m=m, K_E=K_E, K_M=K_M, g_hop=g_hop)
+                W = T_t @ W
+        elif order == 2:
+            B = np.eye(dim, dtype=complex)
+            for t in range(1, N_E - 1, 2):
+                T_t_half = build_T_F_trotter(
+                    geom, U.U_x[t, :, :], U.U_y[t, :, :],
+                    a_tau=a_F / 2.0, m=m, K_E=K_E, K_M=K_M, g_hop=g_hop)
+                B = T_t_half @ B
+            W = B.conj().T @ B
+        else:
+            raise ValueError(f"unsupported Trotter order={order} (use 1 or 2)")
+    elif order == 1:
         # Standard first-order Lie-Trotter.
         W = np.eye(dim, dtype=complex)
         for t in range(N_E - 1):
