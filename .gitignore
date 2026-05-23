@@ -1,0 +1,23 @@
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local Monte Carlo checkpoints and result pickles (regeneratable)
+_ckpt_*/
+_atau_scan_pkl/
+*.pkl
+
+# Logs and tmp working files
+*.log
+_tmp_*.py
+_diag_*.py
+_run_*.py
+_*.log
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/
