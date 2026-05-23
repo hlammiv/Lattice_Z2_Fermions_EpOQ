@@ -57,8 +57,13 @@ from scipy.linalg import expm
 
 sys.path.insert(0, '/home/hlamm/Desktop/QC/logdet/m1_toy')
 
+from itertools import product as _product
 from action_z2_staggered import LatticeGeometry, Z2GaugeConfig
-from transfer_matrix_boundary import fock_basis_labels
+
+
+def fock_basis_labels(V3: int) -> list[tuple[int, ...]]:
+    """All 2^V_3 occupation tuples in lex order (index 0 = vacuum |0...0⟩)."""
+    return list(_product((0, 1), repeat=V3))
 
 
 # ----------------------------------------------------------------------------
