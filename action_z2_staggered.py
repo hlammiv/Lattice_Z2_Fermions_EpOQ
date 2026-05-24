@@ -33,33 +33,50 @@ from action_z2_kernels import (
 
 @dataclass
 class LatticeGeometry:
+    """L_x × L_y × L_z × N_E lattice geometry.
+
+    Lz=1 (default) is 2D mode — back-compat with all existing 2D code.
+    Z2GaugeConfig fields keep their 3-axis shapes when Lz=1.
+    Lz>1 activates 3D mode: 4-axis U_x/U_y/U_t arrays plus the new U_z
+    array (z-direction spatial links).
+
+    Phase 40 (2026-05-24) added Lz, site z-coordinate, and η_z.  The
+    action kernel, transfer matrix, and Pauli builder do NOT yet
+    understand Lz>1 — see step 2 (action_z2_kernels) and step 3
+    (transfer_matrix_kbc_trotterized, epoq_classical_sampler).
+    """
     Lx: int
     Ly: int
     N_E: int
     m: float
+    Lz: int = 1
 
     @property
     def V_3(self) -> int:
-        return self.Lx * self.Ly
+        return self.Lx * self.Ly * self.Lz
 
     @property
     def V_4(self) -> int:
         return self.V_3 * self.N_E
 
-    def site_idx(self, t: int, x: int, y: int) -> int:
-        return (t * self.Lx + x) * self.Ly + y
+    def site_idx(self, t: int, x: int, y: int, z: int = 0) -> int:
+        return ((t * self.Lx + x) * self.Ly + y) * self.Lz + z
 
-    def eta(self, mu: int, t: int, x: int, y: int) -> int:
-        """Standard Kogut-Susskind staggered phases.  μ ∈ {0, 1, 2} = {τ, x, y}.
+    def eta(self, mu: int, t: int, x: int, y: int, z: int = 0) -> int:
+        """Standard Kogut-Susskind staggered phases.  μ ∈ {0, 1, 2, 3} = {τ, x, y, z}.
 
-        η_τ = 1 (time direction)
+        η_τ = 1                  (time direction)
         η_x = (-1)^t
         η_y = (-1)^{t+x}
+        η_z = (-1)^{t+x+y}       (new in 3D; reduces to no-op when Lz=1)
 
         These are required to lift the 2^d doubler degeneracy and give a
         sensible (non-degenerate) Dirac matrix.  Without these phases, naive
         fermions + staggered mass have unresolved doublers and det M = 0
         at trivial gauge.
+
+        For 2D (Lz=1) callers may omit the z argument — η_z is never
+        consulted there anyway since there are no z-direction links.
         """
         if mu == 0:
             return 1
@@ -67,40 +84,76 @@ class LatticeGeometry:
             return -1 if (t % 2) else 1
         elif mu == 2:
             return -1 if ((t + x) % 2) else 1
+        elif mu == 3:
+            return -1 if ((t + x + y) % 2) else 1
         raise ValueError(mu)
 
 
 @dataclass
 class Z2GaugeConfig:
-    """Z₂ link variables on the (L_x × L_y × N_E) lattice with OBC.
+    """Z₂ link variables on the (L_x × L_y × L_z × N_E) lattice with OBC.
 
-    Conventions:
-      U_x[t, x, y]: link from (t, x, y) to (t, x+1, y)         (x ∈ [0, L_x−1))
-      U_y[t, x, y]: link from (t, x, y) to (t, x, y+1)         (y ∈ [0, L_y−1))
-      U_t[t, x, y]: link from (t, x, y) to (t+1, x, y)         (t ∈ [0, N_E−1))
+    Conventions (2D / Lz=1 — back-compat, 3-axis arrays):
+      U_x[t, x, y]: link (t, x, y) → (t, x+1, y)         (x ∈ [0, L_x−1))
+      U_y[t, x, y]: link (t, x, y) → (t, x, y+1)         (y ∈ [0, L_y−1))
+      U_t[t, x, y]: link (t, x, y) → (t+1, x, y)         (t ∈ [0, N_E−1))
+      U_z          = None
+
+    Conventions (3D / Lz>1 — 4-axis arrays):
+      U_x[t, x, y, z]: link (t, x, y, z) → (t, x+1, y, z)  (x ∈ [0, L_x−1))
+      U_y[t, x, y, z]: link (t, x, y, z) → (t, x, y+1, z)  (y ∈ [0, L_y−1))
+      U_z[t, x, y, z]: link (t, x, y, z) → (t, x, y, z+1)  (z ∈ [0, L_z−1))
+      U_t[t, x, y, z]: link (t, x, y, z) → (t+1, x, y, z)  (t ∈ [0, N_E−1))
     """
     geom: LatticeGeometry
-    U_x: np.ndarray   # shape (N_E, Lx-1, Ly), entries ±1
-    U_y: np.ndarray   # shape (N_E, Lx, Ly-1), entries ±1
-    U_t: np.ndarray   # shape (N_E-1, Lx, Ly), entries ±1
+    U_x: np.ndarray
+    U_y: np.ndarray
+    U_t: np.ndarray
+    U_z: np.ndarray | None = None
+
+    def __post_init__(self):
+        if self.geom.Lz > 1:
+            if self.U_z is None:
+                raise ValueError(
+                    f"Lz={self.geom.Lz} > 1 requires U_z; got None.")
 
     @classmethod
     def random(cls, geom: LatticeGeometry, rng: np.random.Generator):
+        Lx, Ly, Lz, N_E = geom.Lx, geom.Ly, geom.Lz, geom.N_E
+        if Lz == 1:
+            return cls(
+                geom=geom,
+                U_x=rng.choice([-1, 1], size=(N_E, Lx - 1, Ly)).astype(int),
+                U_y=rng.choice([-1, 1], size=(N_E, Lx, Ly - 1)).astype(int),
+                U_t=rng.choice([-1, 1], size=(N_E - 1, Lx, Ly)).astype(int),
+                U_z=None,
+            )
         return cls(
             geom=geom,
-            U_x=rng.choice([-1, 1], size=(geom.N_E, geom.Lx - 1, geom.Ly)).astype(int),
-            U_y=rng.choice([-1, 1], size=(geom.N_E, geom.Lx, geom.Ly - 1)).astype(int),
-            U_t=rng.choice([-1, 1], size=(geom.N_E - 1, geom.Lx, geom.Ly)).astype(int),
+            U_x=rng.choice([-1, 1], size=(N_E, Lx - 1, Ly, Lz)).astype(int),
+            U_y=rng.choice([-1, 1], size=(N_E, Lx, Ly - 1, Lz)).astype(int),
+            U_t=rng.choice([-1, 1], size=(N_E - 1, Lx, Ly, Lz)).astype(int),
+            U_z=rng.choice([-1, 1], size=(N_E, Lx, Ly, Lz - 1)).astype(int),
         )
 
     @classmethod
     def trivial(cls, geom: LatticeGeometry):
         """All links σ = +1."""
+        Lx, Ly, Lz, N_E = geom.Lx, geom.Ly, geom.Lz, geom.N_E
+        if Lz == 1:
+            return cls(
+                geom=geom,
+                U_x=np.ones((N_E, Lx - 1, Ly), dtype=int),
+                U_y=np.ones((N_E, Lx, Ly - 1), dtype=int),
+                U_t=np.ones((N_E - 1, Lx, Ly), dtype=int),
+                U_z=None,
+            )
         return cls(
             geom=geom,
-            U_x=np.ones((geom.N_E, geom.Lx - 1, geom.Ly), dtype=int),
-            U_y=np.ones((geom.N_E, geom.Lx, geom.Ly - 1), dtype=int),
-            U_t=np.ones((geom.N_E - 1, geom.Lx, geom.Ly), dtype=int),
+            U_x=np.ones((N_E, Lx - 1, Ly, Lz), dtype=int),
+            U_y=np.ones((N_E, Lx, Ly - 1, Lz), dtype=int),
+            U_t=np.ones((N_E - 1, Lx, Ly, Lz), dtype=int),
+            U_z=np.ones((N_E, Lx, Ly, Lz - 1), dtype=int),
         )
 
 
@@ -140,7 +193,15 @@ def gauge_action(geom: LatticeGeometry, U: Z2GaugeConfig,
     strang_M=True: doubled-lattice Strang convention — K_M only at odd slices
     (intermediate gauge states where T_F is applied).  Caller should pass
     K_E_half = −(1/2)·log tanh((a_τ/2)·g_E) and K_M_full = a_τ·g_M.
+
+    Lz > 1 (3D) is not yet supported here — step 2 of Phase 40 extends
+    gauge_action_kernel with xz + yz plaquettes.
     """
+    if geom.Lz != 1:
+        raise NotImplementedError(
+            f"gauge_action: 3D (Lz={geom.Lz}) not yet supported. "
+            f"Phase 40 step 2 will add xz + yz plaquettes."
+        )
     if K_E is None:
         K_E = K
     if K_M is None:
@@ -155,18 +216,30 @@ def gauge_action(geom: LatticeGeometry, U: Z2GaugeConfig,
 
 
 def count_links_and_plaquettes(geom: LatticeGeometry) -> dict:
-    """Sanity check: count links and plaquettes for given geometry."""
-    n_x_links = geom.N_E * (geom.Lx - 1) * geom.Ly
-    n_y_links = geom.N_E * geom.Lx * (geom.Ly - 1)
-    n_t_links = (geom.N_E - 1) * geom.Lx * geom.Ly
-    n_xy_plaq = geom.N_E * (geom.Lx - 1) * (geom.Ly - 1)
-    n_xt_plaq = (geom.N_E - 1) * (geom.Lx - 1) * geom.Ly
-    n_yt_plaq = (geom.N_E - 1) * geom.Lx * (geom.Ly - 1)
+    """Sanity check: count links and plaquettes for given geometry.
+
+    For Lz=1 (2D): same as before.  For Lz>1 (3D): includes z-links and
+    xz + yz spatial plaquettes plus zτ temporal plaquettes.
+    """
+    Lx, Ly, Lz, N_E = geom.Lx, geom.Ly, geom.Lz, geom.N_E
+    n_x_links = N_E * (Lx - 1) * Ly * Lz
+    n_y_links = N_E * Lx * (Ly - 1) * Lz
+    n_z_links = N_E * Lx * Ly * (Lz - 1)
+    n_t_links = (N_E - 1) * Lx * Ly * Lz
+    n_xy_plaq = N_E * (Lx - 1) * (Ly - 1) * Lz
+    n_xz_plaq = N_E * (Lx - 1) * Ly * (Lz - 1)
+    n_yz_plaq = N_E * Lx * (Ly - 1) * (Lz - 1)
+    n_xt_plaq = (N_E - 1) * (Lx - 1) * Ly * Lz
+    n_yt_plaq = (N_E - 1) * Lx * (Ly - 1) * Lz
+    n_zt_plaq = (N_E - 1) * Lx * Ly * (Lz - 1)
     return {
-        'x_links': n_x_links, 'y_links': n_y_links, 't_links': n_t_links,
-        'total_links': n_x_links + n_y_links + n_t_links,
-        'xy_plaq': n_xy_plaq, 'xt_plaq': n_xt_plaq, 'yt_plaq': n_yt_plaq,
-        'total_plaq': n_xy_plaq + n_xt_plaq + n_yt_plaq,
+        'x_links': n_x_links, 'y_links': n_y_links,
+        'z_links': n_z_links, 't_links': n_t_links,
+        'total_links': n_x_links + n_y_links + n_z_links + n_t_links,
+        'xy_plaq': n_xy_plaq, 'xz_plaq': n_xz_plaq, 'yz_plaq': n_yz_plaq,
+        'xt_plaq': n_xt_plaq, 'yt_plaq': n_yt_plaq, 'zt_plaq': n_zt_plaq,
+        'total_plaq': n_xy_plaq + n_xz_plaq + n_yz_plaq
+                      + n_xt_plaq + n_yt_plaq + n_zt_plaq,
     }
 
 
