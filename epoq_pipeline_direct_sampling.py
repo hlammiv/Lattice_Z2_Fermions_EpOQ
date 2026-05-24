@@ -173,6 +173,205 @@ def accumulate_C_direct(
     return C, C_denom, Trho_O, n_configs
 
 
+def accumulate_C_direct_slab(
+    geom: LatticeGeometry,
+    configs,
+    a_tau: float,
+    times,
+    H_sparse,
+    m_obs: float,
+    g_hop: float,
+    w_order: int = 1,
+    require_temporal_gauge: bool = True,
+    progress: bool = True,
+    progress_every: int = 32,
+):
+    """Slab-projected accumulator: never materializes the dense (DIM, DIM) O_t.
+
+    Phase 41.5 — for V_3 ≥ 6 (or wherever dense O_t doesn't fit RAM).
+
+    Algorithm
+    =========
+    Per unique gauge sector g ∈ {g_top, g_bot}(configs), build
+        E[g, t] :=  O_t · (F/2 unit vectors at gauge sector g)   ∈ ℂ^(DIM × F/2)
+    via two sparse `expm_multiply` calls:
+        v_{g,pb}  =  |pb, g⟩  for pb ∈ surviving (= pb-bit-0 = 1)
+        c_{g,pb}  =  U(t) · n_0 · v_{g,pb}   (right n_0 is folded into surviving)
+        d_{g,pb}  =  n_0 · c_{g,pb}          (middle n_0, diagonal apply)
+        E[g, t][:, k]  =  U(t)† · d_{g,pb(k)}  (left side of O_t)
+
+    Then per config (g_top, g_bot, W_psi), the two submatrices needed
+    by the half-and-half Hermitization sum (mirror of the dense path):
+        O_sub_top_bot[pt, pb] = E[g_bot, t][g_top::G, :]   (re-embedded over dead pb)
+        O_sub_bot_top[pb, pt] = E[g_top, t][g_bot::G, :].T  (same)
+    The row-stride `g_left::G` exactly extracts indices (pt<<n_g) | g_left
+    for pt ∈ [0, F), since G = 2^n_g.
+
+    Cost
+    ====
+    Phase 1 (W_psi per config):  same as dense path.
+    Phase 2 (E cache per (g, t)):  |unique g| × |times| sparse expm pairs.
+        At V_3=6 (dim 8192, nnz ~92K, F/2=32): ~100ms per sparse expm pair.
+        |unique g| ≤ G = 128 → ~100 s for 4 times.
+    Phase 3 (per-config contraction):  F³ matmul per (config, t).  Negligible.
+
+    Args:
+        H_sparse: sparse CSR H_QC (epoq_classical_sampler.build_sparse_H_QC).
+        Other args mirror accumulate_C_direct.
+
+    Returns:
+        (C, C_denom, Trho_O, n_configs)  — same shape as accumulate_C_direct.
+    """
+    import time as _time
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import expm_multiply
+
+    V3 = geom.V_3
+    F = 1 << V3
+    n_gauge_qubits, _ = qc_layout_counts(geom)
+    G = 1 << n_gauge_qubits
+    DIM = F * G
+    if H_sparse.shape != (DIM, DIM):
+        raise ValueError(
+            f"H_sparse shape {H_sparse.shape} != ({DIM},{DIM}) expected "
+            f"for geom (Lx={geom.Lx}, Ly={geom.Ly}).")
+
+    q_n0 = n_gauge_qubits  # matter site (0,0) qubit position
+
+    if geom.Lx == 2 and geom.Ly == 2:
+        gauge_extractor = gauge_qc_bits_from_slice
+    else:
+        def gauge_extractor(U, t_slice):
+            return gauge_qc_bits_general(U, t_slice, geom)
+
+    idx_to_psi = _fock_index_to_psi_map(V3)
+    P = np.zeros((F, F), dtype=complex)
+    for li in range(F):
+        P[idx_to_psi[li], li] = 1.0
+
+    # -- Phase 1: scan configs, build W_psi cache, collect (g_top, g_bot)
+    if progress:
+        print("  Phase 1: building W_psi cache from configs...", flush=True)
+    t1 = _time.time()
+    config_W_psi = []
+    config_g_top = []
+    config_g_bot = []
+    unique_g = set()
+    for U in configs:
+        if require_temporal_gauge:
+            assert (U.U_t == 1).all()
+        W_full, _ = compute_combined_weight_trotter(
+            geom, U, a_tau=a_tau, K_E=0.0, K_M=0.0,
+            m_obs=m_obs, g_hop=g_hop, order=w_order,
+        )
+        W_psi = P @ W_full @ P.T
+        g_top = gauge_extractor(U, geom.N_E - 1)
+        g_bot = gauge_extractor(U, 0)
+        config_W_psi.append(W_psi)
+        config_g_top.append(g_top)
+        config_g_bot.append(g_bot)
+        unique_g.add(g_top)
+        unique_g.add(g_bot)
+    n_configs = len(config_W_psi)
+    unique_g_list = sorted(unique_g)
+    if progress:
+        print(f"    {n_configs} configs, |unique g|={len(unique_g)} "
+              f"(of {G} possible), wall {_time.time()-t1:.1f}s", flush=True)
+
+    # -- Phase 2: per unique g and per t, build E[g, t] (DIM, F/2)
+    surviving_pb = np.array([pb for pb in range(F) if (pb & 1)],
+                            dtype=np.int64)
+    n_surv = len(surviving_pb)
+
+    n0_diag = ((np.arange(DIM, dtype=np.int64) >> q_n0) & 1).astype(complex)
+
+    if progress:
+        print(f"  Phase 2: O_t cache  ({len(unique_g)} g × {len(times)} t × "
+              f"2 sparse expm calls each)...", flush=True)
+    t2 = _time.time()
+
+    E_cache = {}  # (g, t) -> (DIM, F/2) dense complex
+    for g_idx, g in enumerate(unique_g_list):
+        # Build (DIM, n_surv) RHS B: one unit vector per surviving pb at gauge g.
+        B = np.zeros((DIM, n_surv), dtype=complex)
+        for k, pb in enumerate(surviving_pb):
+            B[(pb << n_gauge_qubits) | g, k] = 1.0
+        for t in times:
+            if t == 0.0:
+                # U(0) = I → E = n_0 · B = n0_diag[:, None] * B
+                E = n0_diag[:, None] * B
+            else:
+                # Apply U(t):
+                C_mat = expm_multiply(-1j * t * H_sparse, B)
+                # Apply middle n_0 (diagonal):
+                C_mat *= n0_diag[:, None]
+                # Apply U(t)†:
+                E = expm_multiply(+1j * t * H_sparse, C_mat)
+            E_cache[(g, t)] = E
+
+        if progress and ((g_idx + 1) % progress_every == 0
+                         or g_idx == len(unique_g_list) - 1):
+            elapsed = _time.time() - t2
+            eta = elapsed / (g_idx + 1) * (len(unique_g_list) - g_idx - 1)
+            print(f"    g {g_idx+1}/{len(unique_g_list)}: "
+                  f"elapsed {elapsed:.1f}s, ETA {eta:.1f}s", flush=True)
+
+    if progress:
+        print(f"  Phase 2 done in {_time.time()-t2:.1f}s.", flush=True)
+
+    # -- Phase 3: per config, lookup, extract submatrices, contract.
+    if progress:
+        print("  Phase 3: contracting per-config...", flush=True)
+    t3 = _time.time()
+
+    C_denom = 0.0
+    Trho_O = {t: 0.0 + 0.0j for t in times}
+
+    for i in range(n_configs):
+        W_psi = config_W_psi[i]
+        g_top = config_g_top[i]
+        g_bot = config_g_bot[i]
+
+        if g_top == g_bot:
+            C_denom += np.trace(W_psi).real
+
+        for t in times:
+            # E[g_bot, t][g_top::G, :]   gives the (F, F/2) partial:
+            #   E_for_pb_at_g_bot[g_top::G, k] = O_t[(pt<<n_g)|g_top, (pb(k)<<n_g)|g_bot]
+            # So this is the O_sub_top_bot piece (no transpose).
+            E_g_bot = E_cache[(g_bot, t)]
+            partial_tb = E_g_bot[g_top::G, :]  # (F, F/2)
+            O_sub_top_bot = np.zeros((F, F), dtype=complex)
+            O_sub_top_bot[:, surviving_pb] = partial_tb
+
+            # E[g_top, t][g_bot::G, :]  gives the (F, F/2) partial:
+            #   E_for_pb_at_g_top[g_bot::G, k] = O_t[(pt<<n_g)|g_bot, (pb(k)<<n_g)|g_top]
+            # Note: index name "pt" here is the matter sector of the FIRST argument
+            # which is the BRA side g_bot.  We then transpose to get pb,pt order
+            # consistent with how accumulate_C_direct uses O_sub_bot_top.
+            E_g_top = E_cache[(g_top, t)]
+            partial_bt = E_g_top[g_bot::G, :]   # (F, F/2)
+            # partial_bt[m, k] = O_t[(m<<n_g)|g_bot, (surviving_pb[k]<<n_g)|g_top]
+            # Re-embed across full pb axis:
+            O_sub_bot_top = np.zeros((F, F), dtype=complex)
+            O_sub_bot_top[:, surviving_pb] = partial_bt
+
+            tr_rho_O = np.trace(W_psi @ O_sub_bot_top)
+            tr_rho_dag_O = np.sum(W_psi.conj() * O_sub_top_bot)
+            Trho_O[t] += 0.5 * (tr_rho_O + tr_rho_dag_O)
+
+    if progress:
+        print(f"  Phase 3 done in {_time.time()-t3:.1f}s.", flush=True)
+
+    if C_denom == 0.0:
+        raise RuntimeError(
+            f"Tr[ρ_H] = 0 after {n_configs} configs (no g_top == g_bot). "
+            f"Expected nonzero with non-trivial temporal-gauge MC.")
+
+    C = {t: Trho_O[t].real / C_denom for t in times}
+    return C, C_denom, Trho_O, n_configs
+
+
 def assemble_rho_dense(
     geom: LatticeGeometry,
     configs,
