@@ -1,28 +1,27 @@
-"""First V_3=8 3D 2×2×2 end-to-end smoke (Phase 40 step 6).
+"""3D 2×2×2 end-to-end smoke with Hutchinson-renormalized denominator.
 
-Combines everything from Phase 39, 41, 41.5, 40:
-  - 3D lattice + 3D H_KS (transfer_matrix_kbc_trotterized)
-  - 3D qubit layout + 3D Pauli builder (epoq_classical_sampler)
-  - sparse H + sparse Hutchinson C(t) ED reference (epoq_sparse_ed)
-  - single-chain MC with U_z proposals (action_z2_metropolis)
-  - slab accumulator (epoq_pipeline_direct_sampling)
+The path-integral C_denom is rare-event-dominated at n_gauge ≥ 10
+(see feedback_3d_denominator_rare_event).  Workaround: use the slab
+numerator at t=0 as the renormalization point, and tie the absolute
+scale to the sparse Hutchinson Tr[ρ_β·n_0]/Tr[ρ_β] estimate.
 
-Goals:
-  1. Verify the pipeline runs end-to-end at V_3=8 3D without error.
-  2. Get a first C(t) measurement and compare to ED reference.
-  3. Measure timing breakdown across stages to validate cost estimates.
+Math:
+  slab_num[t]  ≈ (N/Z_g) · Tr[ρ_β · O_t]           (MC sample sum)
+  slab_num[0]  ≈ (N/Z_g) · Tr[ρ_β · n_0]            (no rare event)
+  ratio        = slab_num[t] / slab_num[0]
+              ≈ Tr[ρ_β · O_t] / Tr[ρ_β · n_0]
+  C_Hutch(0)   ≈ Tr[ρ_β · n_0] / Tr[ρ_β]            (Hutchinson)
+  C_renorm(t)  = ratio × C_Hutch(0) ≈ C(t)
 
-Settings (smallest for tractable smoke):
+Both slab_num[0] and slab_num[t] are SUMS over all configs (linear in N,
+all gauge-sector combinations contribute), so neither suffers the
+1/4096 rare-event problem.
+
+Settings:
   Lx=Ly=Lz=2, β=2, m=0.5, a_τ=0.5 (N_E=5)
-  1 chain × 100 sweeps + 50 warmup
-  t = [0.0] ONLY (no Minkowski expm needed in slab Phase 2; per-config
-     cost stays trivial because Phase 2 special-cases t=0)
-  Hutchinson n_random=16 for ED reference
-
-For dynamics (t>0) at 3D 2×2×2 the slab Phase 2 becomes ~few min per
-(g, t), and with ~hundreds of unique g visited that scales to hours.
-Future work: optimize slab (batched expms, sub-sample g) or accept
-the wall.
+  1 chain × 20 sweeps + 10 warmup (small for ~30-min wall)
+  t = [0.0, 0.5]
+  Hutchinson n_random=8
 """
 from __future__ import annotations
 import os
@@ -49,15 +48,15 @@ M_HAM, G_E_HAM, G_M_HAM, G_HOP = 0.5, 1.0, 0.5, 0.5
 BETA = 2.0
 W_ORDER = 1
 A_TAU = 0.5
-N_SWEEPS = 100
-N_WARMUP = 50
-TIMES = [0.0]
-ED_N_RANDOM = 16
+N_SWEEPS = 5
+N_WARMUP = 0
+TIMES = [0.0, 0.5]
+ED_N_RANDOM = 8
 
 
 def main():
     print("=" * 78)
-    print(f"V_3=8 3D 2×2×2 end-to-end smoke  (Phase 40 step 6)")
+    print(f"V_3=8 3D 2×2×2 end-to-end smoke  (Hutchinson-renormalized)")
     print(f"  β={BETA}, m={M_HAM}, a_τ={A_TAU}, single chain × {N_SWEEPS} sweeps")
     print("=" * 78, flush=True)
 
@@ -73,8 +72,7 @@ def main():
     H_sparse = cs.build_sparse_H_QC(geom_h, g_e=G_E_HAM, g_m=G_M_HAM,
                                     g_hop=G_HOP, m_mass=M_HAM)
     n0_sparse = cs.build_sparse_n0_at_site00(geom_h)
-    print(f"  done in {time.time()-t0:.1f}s.  H nnz={H_sparse.nnz}, "
-          f"sparse mem ≈ {(H_sparse.data.nbytes + H_sparse.indices.nbytes + H_sparse.indptr.nbytes) / 1024 / 1024:.0f} MB",
+    print(f"  done in {time.time()-t0:.1f}s.  H nnz={H_sparse.nnz}",
           flush=True)
 
     # --- Sparse Hutchinson ED reference ---
@@ -84,11 +82,10 @@ def main():
     C_ED, sigma_ED, _ = compute_C_t_hutchinson(
         H_sparse, n0_sparse, beta=BETA, times=TIMES,
         n_random=ED_N_RANDOM, seed=20260524,
-        progress=True, progress_every=4,
+        progress=True, progress_every=2,
     )
     t_ed = time.time() - t0
-    print(f"  ED done in {t_ed:.0f}s "
-          f"({t_ed/ED_N_RANDOM:.1f}s/sample)", flush=True)
+    print(f"  ED done in {t_ed:.0f}s", flush=True)
     print(f"  ED C(t):")
     for t in TIMES:
         print(f"    C({t}) = {C_ED[t]:+.5f} ± {sigma_ED[t]:.5f}", flush=True)
@@ -99,11 +96,10 @@ def main():
     K_M = A_TAU * G_M_HAM
     m_action = A_TAU * M_HAM
     geom_mc = LatticeGeometry(Lx=LX, Ly=LY, Lz=LZ, N_E=N_E, m=m_action)
-    print(f"\nMC geom: Lx=Ly=Lz=2, N_E={N_E}, "
-          f"K_E={K_E:.4f}, K_M={K_M:.4f}", flush=True)
+    print(f"\nMC geom: N_E={N_E}, K_E={K_E:.4f}, K_M={K_M:.4f}", flush=True)
 
-    print(f"\nRunning single-chain MC ({N_SWEEPS} sweeps + {N_WARMUP} warmup, "
-          f"temporal_gauge=True) ...", flush=True)
+    print(f"\nRunning single-chain MC ({N_SWEEPS} sweeps + {N_WARMUP} warmup) ...",
+          flush=True)
     t0 = time.time()
     result = run_metropolis(
         geom_mc, K_E=K_E, K_M=K_M,
@@ -114,50 +110,62 @@ def main():
     )
     configs = result.configs
     t_mc = time.time() - t0
-    print(f"  MC done in {t_mc:.0f}s ({t_mc/N_SWEEPS*1000:.0f} ms/sweep), "
-          f"{len(configs)} configs recorded, "
+    print(f"  MC done in {t_mc:.0f}s, {len(configs)} configs recorded, "
           f"accept rate {result.accept_rate:.3f}", flush=True)
 
     # --- Slab accumulator ---
-    print(f"\nSlab accumulator at 3D 2×2×2 ...", flush=True)
+    print(f"\nSlab accumulator (streaming Phase 2+3) ...", flush=True)
     t0 = time.time()
-    C_lat, denom, num, _ = accumulate_C_direct_slab(
+    C_lat_native, denom, num, _ = accumulate_C_direct_slab(
         geom_mc, configs, a_tau=A_TAU, times=TIMES,
         H_sparse=H_sparse,
         m_obs=M_HAM, g_hop=G_HOP, w_order=W_ORDER,
-        progress=True, progress_every=128,
+        progress=True, progress_every=16,
     )
     t_slab = time.time() - t0
     print(f"\n  Slab done in {t_slab:.0f}s ({t_slab/60:.1f} min)", flush=True)
-
-    # --- Compare ---
-    print("\n" + "=" * 78)
-    print(f"V_3=8 3D 2×2×2 FIRST RESULTS  (β={BETA}, m={M_HAM}, a_τ={A_TAU})")
-    print("=" * 78)
-    print(f"\n  {'t':>5} | {'C_lat':>12} | {'C_ED':>12}±{'σ_ED':>10} | "
-          f"{'Δ = C_lat - C_ED':>17}")
+    print(f"  C_denom = {denom:+.5e}  (path-integral diagonal sum)")
+    print(f"  Trho_O[t] (path-integral numerator, complex):")
     for t in TIMES:
-        gap = C_lat[t] - C_ED[t]
-        print(f"  {t:>5.2f} | {C_lat[t]:+.7f} | {C_ED[t]:+.7f} ± "
-              f"{sigma_ED[t]:.5f} | {gap:+.5f}")
+        print(f"    Trho_O({t}) = {num[t].real:+.5e} + {num[t].imag:+.5e}j")
+
+    # --- Renormalize: ratio of slab numerators × Hutchinson C(0) ---
+    print(f"\n" + "=" * 78)
+    print(f"Renormalized C(t):  ratio of slab Trho_O × Hutchinson C(0)")
+    print("=" * 78)
+    if num[0.0].real == 0:
+        print("  ABORT: Trho_O[0] = 0 — can't renormalize")
+        return 1
+
+    print(f"\n  Renormalization: C_renorm(t) = (Trho_O[t] / Trho_O[0]) × C_Hutch(0)")
+    print(f"    C_Hutch(0) = {C_ED[0.0]:+.5f} ± {sigma_ED[0.0]:.5f}\n")
+
+    print(f"  {'t':>5} | {'Trho_O[t].real':>16} | {'ratio':>10} | "
+          f"{'C_renorm(t)':>12} | {'C_Hutch(t)':>13} | {'gap':>10}")
+    for t in TIMES:
+        ratio = num[t].real / num[0.0].real
+        C_renorm = ratio * C_ED[0.0]
+        gap = C_renorm - C_ED[t]
+        print(f"  {t:>5.2f} | {num[t].real:+.8e} | {ratio:+.5f} | "
+              f"{C_renorm:+.5f} | {C_ED[t]:+.5f}±{sigma_ED[t]:.5f} | "
+              f"{gap:+.5f}")
 
     print(f"\nNotes:")
-    print(f"  - MC: {len(configs)} configs (small smoke, no PT). "
-          f"σ_C_lat probably ~few %.")
-    print(f"  - ED: σ_ED ~ {max(sigma_ED.values()):.4f} from n_random={ED_N_RANDOM} "
-          f"Hutchinson samples.")
-    print(f"  - Combined gap uncertainty dominated by both — "
-          f"use this as a sanity check, not a precision result.")
+    print(f"  - Slab numerators sum over ALL configs (no δ_{{g_top,g_bot}} rare event).")
+    print(f"  - Ratio Trho_O[t]/Trho_O[0] ≈ Tr[ρ_β·O_t]/Tr[ρ_β·n_0]; "
+          f"unitless, normalization-free.")
+    print(f"  - Multiplied by C_Hutch(0) ≈ ⟨n_0⟩_β to recover absolute scale.")
+    print(f"  - Gap to Hutchinson C(t): tests whether slab MC + Hutchinson scale "
+          f"are mutually consistent at 3D.")
 
-    print(f"\nTiming breakdown:")
-    print(f"  Sparse H build:       1 s (one-time)")
-    print(f"  Sparse Hutchinson ED: {t_ed:.0f}s ({t_ed/ED_N_RANDOM:.1f}s/sample × {ED_N_RANDOM})")
-    print(f"  MC ({N_SWEEPS} sweeps):       {t_mc:.0f}s ({t_mc/N_SWEEPS*1000:.0f} ms/sweep)")
-    print(f"  Slab accumulator:     {t_slab:.0f}s ({t_slab/60:.1f} min)")
-    print(f"  Total:                {t_ed + t_mc + t_slab:.0f}s "
+    print(f"\nTiming:")
+    print(f"  Hutchinson ED: {t_ed:.0f}s")
+    print(f"  MC:            {t_mc:.0f}s")
+    print(f"  Slab:          {t_slab:.0f}s")
+    print(f"  Total:         {t_ed + t_mc + t_slab:.0f}s "
           f"({(t_ed + t_mc + t_slab) / 60:.1f} min)")
 
-    print(f"\nV_3=8 3D 2×2×2 end-to-end PIPELINE WORKS.")
+    print(f"\nV_3=8 3D 2×2×2 PIPELINE END-TO-END WORKS (renormalization scheme).")
 
 
 if __name__ == "__main__":

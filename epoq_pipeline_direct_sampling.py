@@ -464,11 +464,21 @@ def accumulate_C_direct_slab(
         print(f"  Phase 2+3 done in {_time.time()-t23:.1f}s.", flush=True)
 
     if C_denom == 0.0:
-        raise RuntimeError(
-            f"Tr[ρ_H] = 0 after {n_configs} configs (no g_top == g_bot). "
-            f"Expected nonzero with non-trivial temporal-gauge MC.")
-
-    C = {t: Trho_O[t].real / C_denom for t in times}
+        # No MC config landed on the diagonal (g_top == g_bot) — at
+        # 3D 2×2×2 n_gauge=12 the per-config probability is 1/4096 so
+        # this is the EXPECTED outcome at small chain length.
+        # Return NaN for C(t); caller can renormalize using Trho_O[t]
+        # ratios + a Hutchinson Tr[ρ_β] scale.  See
+        # [[feedback_3d_denominator_rare_event]].
+        import warnings as _w
+        _w.warn(
+            f"slab C_denom = 0 after {n_configs} configs "
+            f"(no g_top == g_bot).  At n_gauge >= 10 this is rare-event-"
+            f"dominated.  Returning NaN C(t); caller should renormalize "
+            f"Trho_O[t] via Trho_O[t_ref]/C_ED(t_ref).")
+        C = {t: float('nan') for t in times}
+    else:
+        C = {t: Trho_O[t].real / C_denom for t in times}
     return C, C_denom, Trho_O, n_configs
 
 
