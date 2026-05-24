@@ -184,6 +184,98 @@ def gauge_action_kernel(Lx: int, Ly: int, N_E: int,
 
 
 # ---------------------------------------------------------------------------
+# Gauge action S_g — 3D extension (Phase 40 step 2, 2026-05-24)
+# ---------------------------------------------------------------------------
+@njit(cache=True)
+def gauge_action_kernel_3d(Lx: int, Ly: int, Lz: int, N_E: int,
+                           K_E: float, K_M: float,
+                           U_x: np.ndarray, U_y: np.ndarray,
+                           U_z: np.ndarray, U_t: np.ndarray,
+                           strang_M: bool = False) -> float:
+    """3D extension of gauge_action_kernel.
+
+    Plaquettes:
+      Spatial (magnetic, coupling K_M):
+        xy: U_x[t,x,y,z] · U_y[t,x+1,y,z] · U_x[t,x,y+1,z] · U_y[t,x,y,z]
+        xz: U_x[t,x,y,z] · U_z[t,x+1,y,z] · U_x[t,x,y,z+1] · U_z[t,x,y,z]
+        yz: U_y[t,x,y,z] · U_z[t,x,y+1,z] · U_y[t,x,y,z+1] · U_z[t,x,y,z]
+      Temporal (electric, coupling K_E):
+        xτ: U_x[t,x,y,z] · U_t[t,x+1,y,z] · U_x[t+1,x,y,z] · U_t[t,x,y,z]
+        yτ: U_y[t,x,y,z] · U_t[t,x,y+1,z] · U_y[t+1,x,y,z] · U_t[t,x,y,z]
+        zτ: U_z[t,x,y,z] · U_t[t,x,y,z+1] · U_z[t+1,x,y,z] · U_t[t,x,y,z]
+
+    Reduces to the 2D `gauge_action_kernel` when Lz=1 (z-axis loops empty;
+    xz, yz, zτ plaquettes vanish since they require Lz ≥ 2).
+    """
+    total_E = 0.0
+    total_M = 0.0
+
+    # --- Spatial magnetic plaquettes ---
+    for t in range(N_E):
+        if strang_M and (t % 2 == 0):
+            continue
+        # xy plaquettes (one per z layer)
+        for z in range(Lz):
+            for x in range(Lx - 1):
+                for y in range(Ly - 1):
+                    u1 = U_x[t, x, y, z]
+                    u2 = U_y[t, x + 1, y, z]
+                    u3 = U_x[t, x, y + 1, z]
+                    u4 = U_y[t, x, y, z]
+                    total_M += u1 * u2 * u3 * u4
+        # xz plaquettes
+        for y in range(Ly):
+            for x in range(Lx - 1):
+                for z in range(Lz - 1):
+                    u1 = U_x[t, x, y, z]
+                    u2 = U_z[t, x + 1, y, z]
+                    u3 = U_x[t, x, y, z + 1]
+                    u4 = U_z[t, x, y, z]
+                    total_M += u1 * u2 * u3 * u4
+        # yz plaquettes
+        for x in range(Lx):
+            for y in range(Ly - 1):
+                for z in range(Lz - 1):
+                    u1 = U_y[t, x, y, z]
+                    u2 = U_z[t, x, y + 1, z]
+                    u3 = U_y[t, x, y, z + 1]
+                    u4 = U_z[t, x, y, z]
+                    total_M += u1 * u2 * u3 * u4
+
+    # --- Spatial-temporal electric plaquettes ---
+    for t in range(N_E - 1):
+        # xτ
+        for z in range(Lz):
+            for x in range(Lx - 1):
+                for y in range(Ly):
+                    u1 = U_x[t, x, y, z]
+                    u2 = U_t[t, x + 1, y, z]
+                    u3 = U_x[t + 1, x, y, z]
+                    u4 = U_t[t, x, y, z]
+                    total_E += u1 * u2 * u3 * u4
+        # yτ
+        for z in range(Lz):
+            for x in range(Lx):
+                for y in range(Ly - 1):
+                    u1 = U_y[t, x, y, z]
+                    u2 = U_t[t, x, y + 1, z]
+                    u3 = U_y[t + 1, x, y, z]
+                    u4 = U_t[t, x, y, z]
+                    total_E += u1 * u2 * u3 * u4
+        # zτ
+        for x in range(Lx):
+            for y in range(Ly):
+                for z in range(Lz - 1):
+                    u1 = U_z[t, x, y, z]
+                    u2 = U_t[t, x, y, z + 1]
+                    u3 = U_z[t + 1, x, y, z]
+                    u4 = U_t[t, x, y, z]
+                    total_E += u1 * u2 * u3 * u4
+
+    return -K_E * total_E - K_M * total_M
+
+
+# ---------------------------------------------------------------------------
 # Warm-up: trigger JIT compilation eagerly so worker processes don't pay
 # the compile cost on first MC step.  Call once in each worker.
 # ---------------------------------------------------------------------------
@@ -196,3 +288,11 @@ def warm_up():
     _ = build_dirac_matrix_kernel(Lx, Ly, N_E, 0.5, U_x, U_y, U_t)
     _ = compute_det_M_forward_kernel(Lx, Ly, N_E, 0.5, U_x, U_y)
     _ = gauge_action_kernel(Lx, Ly, N_E, 1.0, 0.5, U_x, U_y, U_t)
+    # 3D kernel warm-up
+    Lz = 2
+    U_x_3d = np.ones((N_E, Lx - 1, Ly, Lz), dtype=np.float64)
+    U_y_3d = np.ones((N_E, Lx, Ly - 1, Lz), dtype=np.float64)
+    U_z_3d = np.ones((N_E, Lx, Ly, Lz - 1), dtype=np.float64)
+    U_t_3d = np.ones((N_E - 1, Lx, Ly, Lz), dtype=np.float64)
+    _ = gauge_action_kernel_3d(Lx, Ly, Lz, N_E, 1.0, 0.5,
+                               U_x_3d, U_y_3d, U_z_3d, U_t_3d)

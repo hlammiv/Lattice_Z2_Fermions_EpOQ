@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from action_z2_kernels import (
     build_dirac_matrix_kernel,
     gauge_action_kernel,
+    gauge_action_kernel_3d,
 )
 
 
@@ -194,22 +195,27 @@ def gauge_action(geom: LatticeGeometry, U: Z2GaugeConfig,
     (intermediate gauge states where T_F is applied).  Caller should pass
     K_E_half = −(1/2)·log tanh((a_τ/2)·g_E) and K_M_full = a_τ·g_M.
 
-    Lz > 1 (3D) is not yet supported here — step 2 of Phase 40 extends
-    gauge_action_kernel with xz + yz plaquettes.
+    Lz > 1 (3D) dispatches to `gauge_action_kernel_3d`, which adds the
+    xz + yz spatial plaquettes and the zτ temporal plaquettes.  Reduces
+    to the 2D kernel when Lz=1 (verified in test_gauge_action_3d.py).
     """
-    if geom.Lz != 1:
-        raise NotImplementedError(
-            f"gauge_action: 3D (Lz={geom.Lz}) not yet supported. "
-            f"Phase 40 step 2 will add xz + yz plaquettes."
-        )
     if K_E is None:
         K_E = K
     if K_M is None:
         K_M = K
-    return float(gauge_action_kernel(
-        geom.Lx, geom.Ly, geom.N_E, K_E, K_M,
+    if geom.Lz == 1:
+        return float(gauge_action_kernel(
+            geom.Lx, geom.Ly, geom.N_E, K_E, K_M,
+            U.U_x.astype(np.float64),
+            U.U_y.astype(np.float64),
+            U.U_t.astype(np.float64),
+            strang_M,
+        ))
+    return float(gauge_action_kernel_3d(
+        geom.Lx, geom.Ly, geom.Lz, geom.N_E, K_E, K_M,
         U.U_x.astype(np.float64),
         U.U_y.astype(np.float64),
+        U.U_z.astype(np.float64),
         U.U_t.astype(np.float64),
         strang_M,
     ))
