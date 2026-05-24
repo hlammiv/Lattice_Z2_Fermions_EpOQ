@@ -1,7 +1,19 @@
 """β=4, m=2 production verification with the full Phase 37/38 fix:
   - W_ORDER = 1 (time-ordered Lie, NOT palindrome)
   - temporal_gauge = True (U_t ≡ +1, sample only U_x, U_y)
-  - ρ̃ → (ρ̃ + ρ̃†)/2 Hermitization AFTER full assembly
+  - ρ̃ → (ρ̃ + ρ̃†)/2 Hermitization (applied implicitly via the
+    half-and-half sum of Tr[ρ̃·O_t] + Tr[ρ̃†·O_t] per config)
+
+Phase 39 refactor (2026-05-24):
+  Replaces the inline 256×256 ρ̃ assembly with direct accumulation of
+  C(t) numerator/denominator scalars via
+  epoq_pipeline_direct_sampling.accumulate_C_direct.  Identity vs the
+  prior path was verified to machine precision in
+  check_v3_4_direct_vs_rho.py — see commit history.
+
+  Diagnostic outputs (‖Δρ‖_F, min_eig, #neg eigs) from the original
+  Phase 38 verification are dropped; they're recorded in
+  project_phase38_complete_fix_verified for reference.
 
 If both fixes together give clean Trotter convergence to ED, this is
 the methodology-paper-ready production setting.
@@ -24,9 +36,7 @@ qs.M_MASS = 2.0
 
 from action_z2_staggered import LatticeGeometry
 from action_z2_metropolis_pt import run_metropolis_pt
-from transfer_matrix_kbc_trotterized import compute_combined_weight_trotter
-from action_minkowski_stitch import gauge_qc_bits_from_slice
-from action_corner_direct_v3 import _fock_index_to_psi_map
+from epoq_pipeline_direct_sampling import accumulate_C_direct
 
 M_HAM, G_E_HAM, G_M_HAM, G_HOP = 2.0, 1.0, 0.5, 0.5
 BETA = 4.0
@@ -61,7 +71,7 @@ def build_H_QC():
     return (H + H.conj().T) / 2
 
 
-def run_one(a_tau, H, rho_ED_n, UOU, n0_op, C_ED):
+def run_one(a_tau, O_total, C_ED):
     N_E = int(round(BETA / a_tau)) + 1
     K_E = -0.5 * np.log(np.tanh(a_tau * G_E_HAM))
     K_M = a_tau * G_M_HAM
@@ -72,7 +82,6 @@ def run_one(a_tau, H, rho_ED_n, UOU, n0_op, C_ED):
     print(f"  temporal gauge: U_t = +1 fixed, only U_x/U_y sampled\n", flush=True)
 
     C_chains = {t: [] for t in TIMES}
-    rho_chains = []
     t_total0 = time.time()
     for ci in range(N_CHAINS):
         seed = 2026 + ci * 11111
@@ -82,47 +91,22 @@ def run_one(a_tau, H, rho_ED_n, UOU, n0_op, C_ED):
             n_sweeps=N_SWEEPS, n_warmup=N_WARMUP, swap_every=5,
             seed=seed, action_type='gauge_only', n_workers=6,
             temporal_gauge=True)
-        top = pt_results[-1]
-        configs = top.configs
+        configs = pt_results[-1].configs
 
-        V3 = geom.V_3
-        idx_to_psi = _fock_index_to_psi_map(V3)
-        rho = np.zeros((256, 256), dtype=complex)
-        for U in configs:
-            # Sanity check: U_t should be all +1
-            assert (U.U_t == 1).all(), "U_t fluctuated despite temporal_gauge=True!"
-            W_full, _ = compute_combined_weight_trotter(
-                geom, U, a_tau=a_tau, K_E=0.0, K_M=0.0,
-                m_obs=M_HAM, g_hop=G_HOP, order=W_ORDER)
-            W_psi = np.zeros((16, 16), dtype=complex)
-            for li in range(16):
-                for lj in range(16):
-                    W_psi[idx_to_psi[li], idx_to_psi[lj]] = W_full[li, lj]
-            g_top = gauge_qc_bits_from_slice(U, geom.N_E - 1)
-            g_bot = gauge_qc_bits_from_slice(U, 0)
-            for pt_idx in range(16):
-                for pb_idx in range(16):
-                    bit_a = (pt_idx << 4) | g_top
-                    bit_b = (pb_idx << 4) | g_bot
-                    rho[bit_a, bit_b] += W_psi[pt_idx, pb_idx]
-        rho = (rho + rho.conj().T) / 2   # post-hoc Hermitization
-        rho_chains.append(rho)
-        rn = rho / np.trace(rho).real
+        C, _, _, _ = accumulate_C_direct(
+            geom, configs, a_tau=a_tau, times=TIMES,
+            O_total_dict=O_total, m_obs=M_HAM, g_hop=G_HOP,
+            w_order=W_ORDER,
+        )
         for t in TIMES:
-            C_chains[t].append(np.real(np.trace(rn @ UOU[t] @ n0_op)))
+            C_chains[t].append(C[t])
         twall = time.time() - t0
         print(f"    chain {ci+1}/{N_CHAINS}, walltime={twall:.0f}s, "
               + "  ".join(f"C({t})={C_chains[t][-1]:+.5f}" for t in TIMES),
               flush=True)
 
     total_wall = time.time() - t_total0
-    rho_combined = np.mean(rho_chains, axis=0)
-    rho_combined_n = rho_combined / np.trace(rho_combined).real
-    eigs = np.real(np.linalg.eigvalsh(rho_combined_n)); eigs.sort()
-    d_ED = np.linalg.norm(rho_combined_n - rho_ED_n)
     print(f"\n  Cross-chain at a_τ={a_tau} (walltime {total_wall:.0f}s):")
-    print(f"  ‖Δρ‖_F = {d_ED:.4f}, min_eig={eigs[0]:+.4e}, "
-          f"#neg = {int((eigs<-1e-6).sum())}/256")
     results = {}
     for t in TIMES:
         vals = np.array(C_chains[t])
@@ -132,17 +116,15 @@ def run_one(a_tau, H, rho_ED_n, UOU, n0_op, C_ED):
         results[t] = (mean, sem, gap)
         print(f"  t={t}: C_lat={mean:+.5f}±{sem:.5f}, C_ED={C_ED[t]:+.5f}, "
               f"gap={gap:+.5f}")
-    return results, d_ED
+    return results
 
 
 def main():
-    print(f"β=4 m=2 PRODUCTION VERIFICATION")
+    print(f"β=4 m=2 PRODUCTION VERIFICATION  (direct-sampling refactor)")
     print(f"  W_ORDER={W_ORDER} (Lie time-ordered), temporal_gauge=True")
     print(f"  {N_CHAINS} chains × {N_SWEEPS} sweeps, 6 PT replicas each", flush=True)
 
     H = build_H_QC()
-    rho_ED = expm(-BETA * H)
-    rho_ED_n = rho_ED / np.trace(rho_ED).real
 
     Z = np.diag([1.0, -1.0]).astype(complex)
     n0_minus = np.array([[1.0]], dtype=complex)
@@ -152,14 +134,17 @@ def main():
     n0_op = 0.5 * np.eye(256, dtype=complex) - 0.5 * n0_minus
 
     UOU = {t: expm(-1j * H * t).conj().T @ n0_op @ expm(-1j * H * t) for t in TIMES}
+    O_total = {t: UOU[t] @ n0_op for t in TIMES}
+
+    rho_ED = expm(-BETA * H)
+    rho_ED_n = rho_ED / np.trace(rho_ED).real
     C_ED = {t: np.real(np.trace(rho_ED_n @ UOU[t] @ n0_op)) for t in TIMES}
     print(f"\nED reference: " + "  ".join(f"C({t})={C_ED[t]:+.5f}" for t in TIMES))
 
     results = {}
     for a_tau in A_TAUS:
-        results[a_tau], _ = run_one(a_tau, H, rho_ED_n, UOU, n0_op, C_ED)
+        results[a_tau] = run_one(a_tau, O_total, C_ED)
 
-    # Final comparison table
     print("\n" + "=" * 80)
     print("β=4 m=2 — Production (ORDER=1 + temporal gauge) vs prior palindrome")
     print("=" * 80)
