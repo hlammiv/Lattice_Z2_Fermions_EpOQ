@@ -249,34 +249,100 @@ def accumulate_C_direct_slab(
     for li in range(F):
         P[idx_to_psi[li], li] = 1.0
 
-    # -- Phase 1: scan configs, build W_psi cache, collect (g_top, g_bot)
+    if w_order != 1:
+        raise NotImplementedError(
+            f"accumulate_C_direct_slab currently only supports w_order=1 "
+            f"(Lie time-ordered).  Got w_order={w_order}.")
+
+    # -- Phase 1: build W_psi per config using a T_F slice cache.
+    #
+    # Per-slice T_F = expm(-a_τ · H_lat_slice[U_x_slice, U_y_slice]) depends
+    # only on the slice gauge config — 2^n_gauge possible values.  With
+    # 30k MC configs × N_E≈17 slices and only 128 unique slice configs,
+    # caching reduces the expm count from 510k → ≤128.  Massive speedup
+    # at small a_τ where N_E is large.
+    from transfer_matrix_kbc_trotterized import build_T_F_trotter
+
+    Lx, Ly = geom.Lx, geom.Ly
+    n_y = Lx * (Ly - 1)
+
+    def decode_slice_bits(slice_bits):
+        """Inverse of gauge_qc_bits_general at fixed geom: → (U_x_slice, U_y_slice).
+        At Lx=Ly=2 also matches gauge_qc_bits_from_slice's bit layout."""
+        U_y_slice = np.ones((Lx, Ly - 1), dtype=int)
+        U_x_slice = np.ones((Lx - 1, Ly), dtype=int)
+        for x in range(Lx):
+            for y in range(Ly - 1):
+                if (slice_bits >> (x * (Ly - 1) + y)) & 1:
+                    U_y_slice[x, y] = -1
+        for x in range(Lx - 1):
+            for y in range(Ly):
+                if (slice_bits >> (n_y + x * Ly + y)) & 1:
+                    U_x_slice[x, y] = -1
+        return U_x_slice, U_y_slice
+
     if progress:
-        print("  Phase 1: building W_psi cache from configs...", flush=True)
+        print("  Phase 1: scanning configs, collecting unique slice configs...",
+              flush=True)
     t1 = _time.time()
-    config_W_psi = []
+
+    # 1a: scan configs, collect (g_top, g_bot) and unique slice gauge bits.
+    config_slice_bits = []   # for each config, length-(N_E-1) list of bits
     config_g_top = []
     config_g_bot = []
     unique_g = set()
+    unique_slice_bits = set()
     for U in configs:
         if require_temporal_gauge:
             assert (U.U_t == 1).all()
-        W_full, _ = compute_combined_weight_trotter(
-            geom, U, a_tau=a_tau, K_E=0.0, K_M=0.0,
-            m_obs=m_obs, g_hop=g_hop, order=w_order,
-        )
-        W_psi = P @ W_full @ P.T
+        slice_bits_list = []
+        for t_slice in range(geom.N_E - 1):
+            sb = gauge_extractor(U, t_slice)
+            slice_bits_list.append(sb)
+            unique_slice_bits.add(sb)
+        config_slice_bits.append(slice_bits_list)
         g_top = gauge_extractor(U, geom.N_E - 1)
         g_bot = gauge_extractor(U, 0)
-        config_W_psi.append(W_psi)
         config_g_top.append(g_top)
         config_g_bot.append(g_bot)
         unique_g.add(g_top)
         unique_g.add(g_bot)
-    n_configs = len(config_W_psi)
-    unique_g_list = sorted(unique_g)
+    n_configs = len(config_slice_bits)
     if progress:
-        print(f"    {n_configs} configs, |unique g|={len(unique_g)} "
+        print(f"    {n_configs} configs, {len(unique_slice_bits)} unique slice "
+              f"gauge configs, |unique g_boundary|={len(unique_g)} "
               f"(of {G} possible), wall {_time.time()-t1:.1f}s", flush=True)
+
+    # 1b: build T_F per unique slice config (cache).
+    if progress:
+        print(f"  Phase 1b: building T_F for {len(unique_slice_bits)} unique "
+              f"slice configs...", flush=True)
+    t1b = _time.time()
+    T_F_cache = {}
+    for sb in unique_slice_bits:
+        U_x_slice, U_y_slice = decode_slice_bits(sb)
+        T_F_cache[sb] = build_T_F_trotter(
+            geom, U_x_slice, U_y_slice, a_tau=a_tau, m=m_obs,
+            K_E=0.0, K_M=0.0, g_hop=g_hop,
+        )
+    if progress:
+        print(f"    {len(T_F_cache)} T_F's built in {_time.time()-t1b:.1f}s.",
+              flush=True)
+
+    # 1c: per config, multiply T_F's via cache and apply lex→psi permutation.
+    if progress:
+        print("  Phase 1c: contracting W per config via cache...", flush=True)
+    t1c = _time.time()
+    config_W_psi = []
+    for slice_bits_list in config_slice_bits:
+        W = np.eye(F, dtype=complex)
+        for sb in slice_bits_list:
+            W = T_F_cache[sb] @ W
+        config_W_psi.append(P @ W @ P.T)
+    if progress:
+        print(f"    {n_configs} W_psi built in {_time.time()-t1c:.1f}s "
+              f"(Phase 1 total {_time.time()-t1:.1f}s).", flush=True)
+    unique_g_list = sorted(unique_g)
 
     # -- Phase 2: per unique g and per t, build E[g, t] (DIM, F/2)
     surviving_pb = np.array([pb for pb in range(F) if (pb & 1)],
