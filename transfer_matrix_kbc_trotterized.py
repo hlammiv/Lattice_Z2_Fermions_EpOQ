@@ -111,35 +111,42 @@ def _chi_ops_lex(V3: int) -> list[tuple[np.ndarray, np.ndarray]]:
 # H_KS on chi-Fock for given spatial gauge config — matches z2_setup
 # ----------------------------------------------------------------------------
 def build_H_lat_slice(geom: LatticeGeometry,
-                      U_x_slice: np.ndarray,    # shape (Lx-1, Ly), ±1
-                      U_y_slice: np.ndarray,    # shape (Lx, Ly-1), ±1
+                      U_x_slice: np.ndarray,
+                      U_y_slice: np.ndarray,
                       m: float,
                       K_E: float = 1.0,
                       K_M: float = 0.5,
-                      g_hop: float = 0.5) -> np.ndarray:
+                      g_hop: float = 0.5,
+                      U_z_slice: np.ndarray = None) -> np.ndarray:
     """Build the per-slice H_KS as a 2^{V_3} × 2^{V_3} matrix in fock_basis_labels
-    basis.  Matches z2_setup / epoq_classical_sampler.build_pauli_terms
-    restricted to the gauge eigenstate {Z_l(t) = u_l(t)} on this slice
-    (with electric K_E·X_l term dropped — it doesn't preserve the gauge
-    eigenstate sector).
+    basis.  At Lz=1 (default 2D), works as before — U_z_slice ignored.
+    At Lz>1 (3D), requires U_z_slice and includes z-direction hopping plus
+    xz + yz magnetic plaquettes.
 
-    Couplings follow z2_setup defaults:
-      g_e = K_E (drops out at fixed gauge eigenstate),
-      g_m = K_M (magnetic plaquette becomes c-number constant per slice),
-      g_hop = 0.5 (hopping coefficient),
-      mass term: m·Σ_a (-1)^{x+y}_a n_chi(a).
-
-    Spatial hopping (STAGGERED K-S, matches the staggered action AND the
-    epoq_quantum_simulator / epoq_classical_sampler Hamiltonians after the
-    2026-05-18 staggered-everywhere fix):
-       H_hop = g_hop · Σ_{links l=(a,b)} η_l · u_l · (c_a† c_b + c_b† c_a)
-    with K-S spatial η: η_x(x,y) = +1, η_y(x,y) = (-1)^x.  In our 2x2 OBC:
-    x-bonds at all y have η=+1; y-bond at x=0 has η=+1; y-bond at x=1 has η=-1.
+    K-S staggered phases (time-fixed Hamiltonian convention):
+       η_x(x,y,z) = +1
+       η_y(x,y,z) = (-1)^x
+       η_z(x,y,z) = (-1)^{x+y}
+    Mass parity: (-1)^{x+y+z}.
     """
+    Lx, Ly, Lz = geom.Lx, geom.Ly, geom.Lz
+    if Lz == 1:
+        return _build_H_lat_slice_2d(geom, U_x_slice, U_y_slice, m,
+                                     K_E, K_M, g_hop)
+    if U_z_slice is None:
+        raise ValueError(
+            f"build_H_lat_slice: Lz={Lz} > 1 requires U_z_slice; got None.")
+    return _build_H_lat_slice_3d(geom, U_x_slice, U_y_slice, U_z_slice,
+                                 m, K_E, K_M, g_hop)
+
+
+def _build_H_lat_slice_2d(geom, U_x_slice, U_y_slice, m, K_E, K_M, g_hop):
+    """Original 2D H_KS construction.  See build_H_lat_slice docstring."""
     Lx, Ly = geom.Lx, geom.Ly
     V3 = Lx * Ly
     dim = 1 << V3
     assert V3 == geom.V_3
+    assert geom.Lz == 1
 
     chi_ops = _chi_ops_lex(V3)
     H = np.zeros((dim, dim), dtype=complex)
@@ -152,8 +159,7 @@ def build_H_lat_slice(geom: LatticeGeometry,
             c_a, cd_a = chi_ops[a]
             H += m * parity * (cd_a @ c_a)
 
-    # --- Staggered K-S spatial hopping: η_l · g_hop · u_l · (c_a† c_b + c_b† c_a) ---
-    # K-S spatial η: η_x(x,y) = +1, η_y(x,y) = (-1)^x.
+    # --- Staggered K-S spatial hopping ---
     # y-bonds: (x, y) → (x, y+1).  η_y = (-1)^x.
     for x in range(Lx):
         for y in range(Ly - 1):
@@ -174,8 +180,7 @@ def build_H_lat_slice(geom: LatticeGeometry,
             c_b, cd_b = chi_ops[b]
             H += g_hop * u * (cd_a @ c_b + cd_b @ c_a)
 
-    # --- Magnetic plaquette: -K_M · Π_{plaq} u_l  (c-number constant)
-    # For 2x2 OBC there is exactly one plaquette per slice.
+    # --- Magnetic plaquette: -K_M · Π_{plaq} u_l  (c-number constant) ---
     plaq_const = 0.0
     for x in range(Lx - 1):
         for y in range(Ly - 1):
@@ -186,7 +191,102 @@ def build_H_lat_slice(geom: LatticeGeometry,
             plaq_const += -K_M * u1 * u2 * u3 * u4
     H += plaq_const * np.eye(dim, dtype=complex)
 
-    # K_E·X_l electric term: dropped (does not preserve gauge eigenstate).
+    H = (H + H.conj().T) / 2.0
+    return H
+
+
+def _build_H_lat_slice_3d(geom, U_x_slice, U_y_slice, U_z_slice,
+                          m, K_E, K_M, g_hop):
+    """3D extension.  Site index a = (x*Ly + y)*Lz + z (matches geom.site_idx
+    restricted to a single time slice).  Adds z-direction hopping with
+    η_z = (-1)^{x+y} and the xz + yz magnetic plaquettes."""
+    Lx, Ly, Lz = geom.Lx, geom.Ly, geom.Lz
+    V3 = Lx * Ly * Lz
+    dim = 1 << V3
+    assert V3 == geom.V_3
+
+    chi_ops = _chi_ops_lex(V3)
+    H = np.zeros((dim, dim), dtype=complex)
+
+    def site(x, y, z):
+        return (x * Ly + y) * Lz + z
+
+    # --- Staggered mass: m * Σ_a (-1)^{x+y+z}_a n_a ---
+    for x in range(Lx):
+        for y in range(Ly):
+            for z in range(Lz):
+                a = site(x, y, z)
+                parity = 1.0 if (x + y + z) % 2 == 0 else -1.0
+                c_a, cd_a = chi_ops[a]
+                H += m * parity * (cd_a @ c_a)
+
+    # --- Hopping y-bonds: (x,y,z)→(x,y+1,z).  η_y = (-1)^x. ---
+    for x in range(Lx):
+        for y in range(Ly - 1):
+            for z in range(Lz):
+                a = site(x, y, z)
+                b = site(x, y + 1, z)
+                u = float(U_y_slice[x, y, z])
+                eta_y = -1.0 if (x % 2) else 1.0
+                c_a, cd_a = chi_ops[a]
+                c_b, cd_b = chi_ops[b]
+                H += eta_y * g_hop * u * (cd_a @ c_b + cd_b @ c_a)
+
+    # --- Hopping x-bonds: (x,y,z)→(x+1,y,z).  η_x = +1. ---
+    for x in range(Lx - 1):
+        for y in range(Ly):
+            for z in range(Lz):
+                a = site(x, y, z)
+                b = site(x + 1, y, z)
+                u = float(U_x_slice[x, y, z])
+                c_a, cd_a = chi_ops[a]
+                c_b, cd_b = chi_ops[b]
+                H += g_hop * u * (cd_a @ c_b + cd_b @ c_a)
+
+    # --- Hopping z-bonds: (x,y,z)→(x,y,z+1).  η_z = (-1)^{x+y}. ---
+    for x in range(Lx):
+        for y in range(Ly):
+            for z in range(Lz - 1):
+                a = site(x, y, z)
+                b = site(x, y, z + 1)
+                u = float(U_z_slice[x, y, z])
+                eta_z = -1.0 if ((x + y) % 2) else 1.0
+                c_a, cd_a = chi_ops[a]
+                c_b, cd_b = chi_ops[b]
+                H += eta_z * g_hop * u * (cd_a @ c_b + cd_b @ c_a)
+
+    # --- Magnetic plaquettes (xy, xz, yz): −K_M · Π_plaq u_l ---
+    plaq_const = 0.0
+    # xy at fixed z
+    for x in range(Lx - 1):
+        for y in range(Ly - 1):
+            for z in range(Lz):
+                u1 = float(U_x_slice[x, y, z])
+                u2 = float(U_y_slice[x + 1, y, z])
+                u3 = float(U_x_slice[x, y + 1, z])
+                u4 = float(U_y_slice[x, y, z])
+                plaq_const += -K_M * u1 * u2 * u3 * u4
+    # xz at fixed y
+    for x in range(Lx - 1):
+        for y in range(Ly):
+            for z in range(Lz - 1):
+                u1 = float(U_x_slice[x, y, z])
+                u2 = float(U_z_slice[x + 1, y, z])
+                u3 = float(U_x_slice[x, y, z + 1])
+                u4 = float(U_z_slice[x, y, z])
+                plaq_const += -K_M * u1 * u2 * u3 * u4
+    # yz at fixed x
+    for x in range(Lx):
+        for y in range(Ly - 1):
+            for z in range(Lz - 1):
+                u1 = float(U_y_slice[x, y, z])
+                u2 = float(U_z_slice[x, y + 1, z])
+                u3 = float(U_y_slice[x, y, z + 1])
+                u4 = float(U_z_slice[x, y, z])
+                plaq_const += -K_M * u1 * u2 * u3 * u4
+
+    H += plaq_const * np.eye(dim, dtype=complex)
+
     H = (H + H.conj().T) / 2.0
     return H
 
@@ -198,16 +298,20 @@ def build_T_F_trotter(geom: LatticeGeometry,
                       m: float,
                       K_E: float = 1.0,
                       K_M: float = 0.5,
-                      g_hop: float = 0.5) -> np.ndarray:
+                      g_hop: float = 0.5,
+                      U_z_slice: np.ndarray = None) -> np.ndarray:
     """Per-step transfer matrix T̂_F = expm(-a_τ · H_KS[slice]).
 
     The "Trotter" in the name reflects that the action this corresponds to
     is the limit of arbitrarily-fine Trotter splitting; we set T̂_F to the
     exact matrix exponential here.  Returns 2^{V_3} × 2^{V_3} complex
     matrix in fock_basis_labels basis.
+
+    At Lz>1 pass U_z_slice through.
     """
     H_slice = build_H_lat_slice(geom, U_x_slice, U_y_slice, m,
-                                K_E=K_E, K_M=K_M, g_hop=g_hop)
+                                K_E=K_E, K_M=K_M, g_hop=g_hop,
+                                U_z_slice=U_z_slice)
     T = expm(-a_tau * H_slice)
     return T
 
@@ -260,8 +364,8 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
 
     Returns (W, info).
     """
-    Lx, Ly = geom.Lx, geom.Ly
-    V3 = Lx * Ly
+    Lx, Ly, Lz = geom.Lx, geom.Ly, geom.Lz
+    V3 = Lx * Ly * Lz
     dim = 1 << V3
     N_E = geom.N_E
     # If m_obs given, use it as the Hamiltonian mass for the OBSERVABLE T̂_F
@@ -269,6 +373,12 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
     # This is essential for continuum-limit studies where action mass scales
     # as a_τ · m_Ham but observable mass stays at m_Ham.
     m = m_obs if m_obs is not None else geom.m
+
+    # Slice extraction helper: at Lz=1 returns U.U_x[t] (shape (Lx-1, Ly));
+    # at Lz>1 returns the 3D slice (shape (Lx-1, Ly, Lz)).
+    def _Ux_slice(t):  return U.U_x[t]
+    def _Uy_slice(t):  return U.U_y[t]
+    def _Uz_slice(t):  return None if Lz == 1 else U.U_z[t]
 
     if strang:
         # Strang: T_F applied at ODD slices only (intermediate gauge states),
@@ -281,15 +391,17 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
             W = np.eye(dim, dtype=complex)
             for t in range(1, N_E - 1, 2):  # odd slices: 1, 3, ..., N_E-2
                 T_t = build_T_F_trotter(
-                    geom, U.U_x[t, :, :], U.U_y[t, :, :],
-                    a_tau=a_F, m=m, K_E=K_E, K_M=K_M, g_hop=g_hop)
+                    geom, _Ux_slice(t), _Uy_slice(t),
+                    a_tau=a_F, m=m, K_E=K_E, K_M=K_M, g_hop=g_hop,
+                    U_z_slice=_Uz_slice(t))
                 W = T_t @ W
         elif order == 2:
             B = np.eye(dim, dtype=complex)
             for t in range(1, N_E - 1, 2):
                 T_t_half = build_T_F_trotter(
-                    geom, U.U_x[t, :, :], U.U_y[t, :, :],
-                    a_tau=a_F / 2.0, m=m, K_E=K_E, K_M=K_M, g_hop=g_hop)
+                    geom, _Ux_slice(t), _Uy_slice(t),
+                    a_tau=a_F / 2.0, m=m, K_E=K_E, K_M=K_M, g_hop=g_hop,
+                    U_z_slice=_Uz_slice(t))
                 B = T_t_half @ B
             W = B.conj().T @ B
         else:
@@ -298,9 +410,9 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
         # Standard first-order Lie-Trotter.
         W = np.eye(dim, dtype=complex)
         for t in range(N_E - 1):
-            T_t = build_T_F_trotter(geom, U.U_x[t, :, :], U.U_y[t, :, :],
+            T_t = build_T_F_trotter(geom, _Ux_slice(t), _Uy_slice(t),
                                     a_tau=a_tau, m=m, K_E=K_E, K_M=K_M,
-                                    g_hop=g_hop)
+                                    g_hop=g_hop, U_z_slice=_Uz_slice(t))
             W = T_t @ W
     elif order == 2:
         # Palindrome (Hermitian PD by construction):
@@ -308,33 +420,65 @@ def compute_combined_weight_trotter(geom: LatticeGeometry,
         #   W = B† @ B
         B = np.eye(dim, dtype=complex)
         for t in range(N_E - 1):
-            T_t_half = build_T_F_trotter(geom, U.U_x[t, :, :], U.U_y[t, :, :],
+            T_t_half = build_T_F_trotter(geom, _Ux_slice(t), _Uy_slice(t),
                                          a_tau=a_tau / 2.0, m=m, K_E=K_E,
-                                         K_M=K_M, g_hop=g_hop)
+                                         K_M=K_M, g_hop=g_hop,
+                                         U_z_slice=_Uz_slice(t))
             B = T_t_half @ B
         W = B.conj().T @ B
     else:
         raise ValueError(f"unsupported Trotter order={order} (use 1 or 2)")
 
-    # --- xτ, yτ plaquettes coupling slice t and t+1 ---
-    # In the gauge-eigenstate basis, these plaquettes Π u_xτ are c-numbers
+    # --- xτ, yτ (and zτ in 3D) plaquettes coupling slice t and t+1 ---
+    # In the gauge-eigenstate basis, these plaquettes Π u are c-numbers
     # that multiply T̂_F[t].  Folded in as scalar prefactor.
     plaq_const_total = 0.0
-    for t in range(N_E - 1):
-        for x in range(Lx - 1):
-            for y in range(Ly):
-                u1 = float(U.U_x[t, x, y])
-                u2 = float(U.U_t[t, x + 1, y])
-                u3 = float(U.U_x[t + 1, x, y])
-                u4 = float(U.U_t[t, x, y])
-                plaq_const_total += -K_M * u1 * u2 * u3 * u4
-        for x in range(Lx):
-            for y in range(Ly - 1):
-                u1 = float(U.U_y[t, x, y])
-                u2 = float(U.U_t[t, x, y + 1])
-                u3 = float(U.U_y[t + 1, x, y])
-                u4 = float(U.U_t[t, x, y])
-                plaq_const_total += -K_M * u1 * u2 * u3 * u4
+    if Lz == 1:
+        for t in range(N_E - 1):
+            for x in range(Lx - 1):
+                for y in range(Ly):
+                    u1 = float(U.U_x[t, x, y])
+                    u2 = float(U.U_t[t, x + 1, y])
+                    u3 = float(U.U_x[t + 1, x, y])
+                    u4 = float(U.U_t[t, x, y])
+                    plaq_const_total += -K_M * u1 * u2 * u3 * u4
+            for x in range(Lx):
+                for y in range(Ly - 1):
+                    u1 = float(U.U_y[t, x, y])
+                    u2 = float(U.U_t[t, x, y + 1])
+                    u3 = float(U.U_y[t + 1, x, y])
+                    u4 = float(U.U_t[t, x, y])
+                    plaq_const_total += -K_M * u1 * u2 * u3 * u4
+    else:
+        # 3D: xτ, yτ, zτ
+        for t in range(N_E - 1):
+            # xτ
+            for x in range(Lx - 1):
+                for y in range(Ly):
+                    for z in range(Lz):
+                        u1 = float(U.U_x[t, x, y, z])
+                        u2 = float(U.U_t[t, x + 1, y, z])
+                        u3 = float(U.U_x[t + 1, x, y, z])
+                        u4 = float(U.U_t[t, x, y, z])
+                        plaq_const_total += -K_M * u1 * u2 * u3 * u4
+            # yτ
+            for x in range(Lx):
+                for y in range(Ly - 1):
+                    for z in range(Lz):
+                        u1 = float(U.U_y[t, x, y, z])
+                        u2 = float(U.U_t[t, x, y + 1, z])
+                        u3 = float(U.U_y[t + 1, x, y, z])
+                        u4 = float(U.U_t[t, x, y, z])
+                        plaq_const_total += -K_M * u1 * u2 * u3 * u4
+            # zτ
+            for x in range(Lx):
+                for y in range(Ly):
+                    for z in range(Lz - 1):
+                        u1 = float(U.U_z[t, x, y, z])
+                        u2 = float(U.U_t[t, x, y, z + 1])
+                        u3 = float(U.U_z[t + 1, x, y, z])
+                        u4 = float(U.U_t[t, x, y, z])
+                        plaq_const_total += -K_M * u1 * u2 * u3 * u4
     # NB: this is a global multiplicative prefactor exp(-a_τ * plaq_const)
     # that does NOT affect normalized observables like ⟨n̂_0⟩, but does
     # affect the raw W magnitude (and matches K_M·Σ Π exactly).

@@ -150,62 +150,89 @@ def build_pauli_terms_general(
     g_hop: float = G_HOP,
     m_mass: float = None,
 ) -> List[Term]:
-    """General H_QC builder for arbitrary L_x × L_y OBC.
+    """General H_QC builder for arbitrary L_x × L_y × L_z OBC.
 
-    At L_x = L_y = 2 this returns a Pauli decomposition equivalent to
-    build_pauli_terms() — same H, possibly different term ordering.  The
-    qubit layout is the natural extension of the 2×2 convention
-    (see action_minkowski_stitch.qc_layout_counts for the exact ordering):
-        q_yl(x,y) = x·(Ly−1) + y                          for x∈[0,Lx), y∈[0,Ly−1)
-        q_xl(x,y) = N_y + x·Ly + y                        for x∈[0,Lx−1), y∈[0,Ly)
-        q_m(x,y)  = N_g + x·Ly + y                        for x∈[0,Lx), y∈[0,Ly)
+    At Lz=1: returns a Pauli decomposition equivalent to build_pauli_terms()
+    at Lx=Ly=2 (back-compat verified by test_pauli_general_2x2.py).
 
-    Hamiltonian (Kogut-Susskind staggered, time-fixed phases):
-        H_E   = −g_e Σ_l  X_l                              (over all link qubits)
-        H_M   = −g_m Σ_plaq  Z_{ℓ1} Z_{ℓ2} Z_{ℓ3} Z_{ℓ4}   (for each xy plaquette)
-        H_hop = Σ_(link l = pair a−b)  (η_l · g_hop / 2) · Z_l · JW(qa,qb) · (X_qa X_qb + Y_qa Y_qb)
-                with η_x = +1 on x-direction links, η_y = (−1)^x on y-direction links.
-        H_m   = m · Σ_site  (−1)^(x+y) · n_site
-              = m · Σ_site  (−1)^(x+y) · (I − Z_qm) / 2
+    Qubit layout (matches action_minkowski_stitch.qc_layout_counts):
+        q_yl(x,y,z) = (x·(Ly−1) + y)·Lz + z
+        q_xl(x,y,z) = N_y + (x·Ly + y)·Lz + z
+        q_zl(x,y,z) = N_y + N_x + (x·Ly + y)·(Lz−1) + z       (Lz>1 only)
+        q_m (x,y,z) = N_g + (x·Ly + y)·Lz + z
 
-    JW(qa,qb) is the product of Z over all matter qubits with index
-    strictly between qa and qb (matter qubits are contiguous by construction).
+    Hamiltonian (K-S staggered, time-fixed phases):
+        H_E   = −g_e Σ_l  X_l
+        H_M   = −g_m Σ_plaq  Z·Z·Z·Z   (xy in 2D + xz + yz in 3D)
+        H_hop = Σ_(link l = pair a−b)
+                  (η_l · g_hop / 2) · Z_l · JW(qa,qb) · (X_qa X_qb + Y_qa Y_qb)
+              with η_x=+1, η_y=(−1)^x, η_z=(−1)^{x+y}.
+        H_m   = m · Σ_site  (−1)^(x+y+z) · n_site
+
+    At Lz=1, η_z and z-direction terms vanish (no z-links); the function
+    reduces to the original 2D builder.
     """
     if m_mass is None:
         m_mass = M_MASS
-    Lx, Ly = geom.Lx, geom.Ly
+    Lx, Ly, Lz = geom.Lx, geom.Ly, geom.Lz
 
-    n_y = Lx * (Ly - 1)
-    n_x = (Lx - 1) * Ly
-    n_g = n_y + n_x
+    n_y = Lx * (Ly - 1) * Lz
+    n_x = (Lx - 1) * Ly * Lz
+    n_z = Lx * Ly * (Lz - 1)
+    n_g = n_y + n_x + n_z
 
-    def q_yl(x, y):
-        return x * (Ly - 1) + y
+    def q_yl(x, y, z):
+        return (x * (Ly - 1) + y) * Lz + z
 
-    def q_xl(x, y):
-        return n_y + x * Ly + y
+    def q_xl(x, y, z):
+        return n_y + (x * Ly + y) * Lz + z
 
-    def q_m(x, y):
-        return n_g + x * Ly + y
+    def q_zl(x, y, z):
+        return n_y + n_x + (x * Ly + y) * (Lz - 1) + z
+
+    def q_m(x, y, z):
+        return n_g + (x * Ly + y) * Lz + z
 
     terms: List[Term] = []
 
     # --- Electric: −g_e Σ_l X_l ---------------------------------------------
     for x in range(Lx):
         for y in range(Ly - 1):
-            terms.append((complex(-g_e), [(q_yl(x, y), "X")]))
+            for z in range(Lz):
+                terms.append((complex(-g_e), [(q_yl(x, y, z), "X")]))
     for x in range(Lx - 1):
         for y in range(Ly):
-            terms.append((complex(-g_e), [(q_xl(x, y), "X")]))
+            for z in range(Lz):
+                terms.append((complex(-g_e), [(q_xl(x, y, z), "X")]))
+    if Lz > 1:
+        for x in range(Lx):
+            for y in range(Ly):
+                for z in range(Lz - 1):
+                    terms.append((complex(-g_e), [(q_zl(x, y, z), "X")]))
 
-    # --- Magnetic plaquettes: −g_m Σ Z_{l1}Z_{l2}Z_{l3}Z_{l4} ----------------
-    # Plaquette at (x,y) for x∈[0,Lx−1), y∈[0,Ly−1) is bounded by
-    #   y-link (x,y), x-link (x,y+1), y-link (x+1,y), x-link (x,y).
+    # --- Magnetic plaquettes: −g_m Σ Z·Z·Z·Z --------------------------------
+    # xy plaquettes at fixed z
     for x in range(Lx - 1):
         for y in range(Ly - 1):
-            qs = sorted([q_yl(x, y), q_xl(x, y + 1),
-                         q_yl(x + 1, y), q_xl(x, y)])
-            terms.append((complex(-g_m), [(q, "Z") for q in qs]))
+            for z in range(Lz):
+                qs = sorted([q_yl(x, y, z), q_xl(x, y + 1, z),
+                             q_yl(x + 1, y, z), q_xl(x, y, z)])
+                terms.append((complex(-g_m), [(q, "Z") for q in qs]))
+    if Lz > 1:
+        # xz plaquettes at fixed y
+        for x in range(Lx - 1):
+            for y in range(Ly):
+                for z in range(Lz - 1):
+                    qs = sorted([q_xl(x, y, z), q_zl(x + 1, y, z),
+                                 q_xl(x, y, z + 1), q_zl(x, y, z)])
+                    terms.append((complex(-g_m), [(q, "Z") for q in qs]))
+        # yz plaquettes at fixed x
+        for x in range(Lx):
+            for y in range(Ly - 1):
+                for z in range(Lz - 1):
+                    qs = sorted([q_yl(x, y, z), q_zl(x, y + 1, z),
+                                 q_yl(x, y, z + 1), q_zl(x, y, z)])
+                    terms.append((complex(-g_m), [(q, "Z") for q in qs]))
 
     def jw_string(qa, qb):
         """Z on every matter qubit strictly between qa and qb (qa < qb)."""
@@ -214,36 +241,60 @@ def build_pauli_terms_general(
     # --- Hopping y-links: η_y = (−1)^x --------------------------------------
     for x in range(Lx):
         for y in range(Ly - 1):
-            ql = q_yl(x, y)
-            qa, qb = q_m(x, y), q_m(x, y + 1)
-            if qa > qb:
-                qa, qb = qb, qa
-            eta = -1.0 if (x % 2) else 1.0
-            jw = jw_string(qa, qb)
-            coef = complex(eta * g_hop * 0.5)
-            terms.append((coef, [(ql, "Z")] + jw + [(qa, "X"), (qb, "X")]))
-            terms.append((coef, [(ql, "Z")] + jw + [(qa, "Y"), (qb, "Y")]))
+            for z in range(Lz):
+                ql = q_yl(x, y, z)
+                qa, qb = q_m(x, y, z), q_m(x, y + 1, z)
+                if qa > qb:
+                    qa, qb = qb, qa
+                eta = -1.0 if (x % 2) else 1.0
+                jw = jw_string(qa, qb)
+                coef = complex(eta * g_hop * 0.5)
+                terms.append((coef,
+                              [(ql, "Z")] + jw + [(qa, "X"), (qb, "X")]))
+                terms.append((coef,
+                              [(ql, "Z")] + jw + [(qa, "Y"), (qb, "Y")]))
 
     # --- Hopping x-links: η_x = +1 ------------------------------------------
     for x in range(Lx - 1):
         for y in range(Ly):
-            ql = q_xl(x, y)
-            qa, qb = q_m(x, y), q_m(x + 1, y)
-            if qa > qb:
-                qa, qb = qb, qa
-            jw = jw_string(qa, qb)
-            coef = complex(g_hop * 0.5)
-            terms.append((coef, [(ql, "Z")] + jw + [(qa, "X"), (qb, "X")]))
-            terms.append((coef, [(ql, "Z")] + jw + [(qa, "Y"), (qb, "Y")]))
+            for z in range(Lz):
+                ql = q_xl(x, y, z)
+                qa, qb = q_m(x, y, z), q_m(x + 1, y, z)
+                if qa > qb:
+                    qa, qb = qb, qa
+                jw = jw_string(qa, qb)
+                coef = complex(g_hop * 0.5)
+                terms.append((coef,
+                              [(ql, "Z")] + jw + [(qa, "X"), (qb, "X")]))
+                terms.append((coef,
+                              [(ql, "Z")] + jw + [(qa, "Y"), (qb, "Y")]))
 
-    # --- Staggered mass: m · Σ (−1)^(x+y) n_site ----------------------------
+    # --- Hopping z-links: η_z = (−1)^{x+y}  (Lz>1) -------------------------
+    if Lz > 1:
+        for x in range(Lx):
+            for y in range(Ly):
+                for z in range(Lz - 1):
+                    ql = q_zl(x, y, z)
+                    qa, qb = q_m(x, y, z), q_m(x, y, z + 1)
+                    if qa > qb:
+                        qa, qb = qb, qa
+                    eta = -1.0 if ((x + y) % 2) else 1.0
+                    jw = jw_string(qa, qb)
+                    coef = complex(eta * g_hop * 0.5)
+                    terms.append((coef,
+                                  [(ql, "Z")] + jw + [(qa, "X"), (qb, "X")]))
+                    terms.append((coef,
+                                  [(ql, "Z")] + jw + [(qa, "Y"), (qb, "Y")]))
+
+    # --- Staggered mass: m · Σ (−1)^(x+y+z) n_site --------------------------
     const_shift = 0.0
     for x in range(Lx):
         for y in range(Ly):
-            qm = q_m(x, y)
-            sgn = 1.0 if ((x + y) % 2 == 0) else -1.0
-            const_shift += 0.5 * m_mass * sgn
-            terms.append((complex(-0.5 * m_mass * sgn), [(qm, "Z")]))
+            for z in range(Lz):
+                qm = q_m(x, y, z)
+                sgn = 1.0 if ((x + y + z) % 2 == 0) else -1.0
+                const_shift += 0.5 * m_mass * sgn
+                terms.append((complex(-0.5 * m_mass * sgn), [(qm, "Z")]))
     if abs(const_shift) > 1e-15:
         terms.append((complex(const_shift), []))
 

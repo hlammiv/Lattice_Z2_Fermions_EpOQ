@@ -48,43 +48,70 @@ def gauge_qc_bits_from_slice(U: Z2GaugeConfig, t_slice: int) -> int:
 def qc_layout_counts(geom: LatticeGeometry) -> tuple[int, int]:
     """Return (n_gauge_qubits, n_matter_qubits) for the general qubit layout.
 
-    Layout (extends the 2×2 convention; identical bit positions at Lx=Ly=2):
-      - y-link qubits, positions [0, N_y):     q = x * (Ly - 1) + y
-                                                for x ∈ [0,Lx), y ∈ [0,Ly-1)
-      - x-link qubits, positions [N_y, N_g):   q = N_y + x * Ly + y
-                                                for x ∈ [0,Lx-1), y ∈ [0,Ly)
-      - matter qubits, positions [N_g, NQ):    q = N_g + x * Ly + y
-                                                for x ∈ [0,Lx), y ∈ [0,Ly)
+    Layout (extends the 2D convention; identical bit positions at Lz=1):
+      - y-link qubits, positions [0, N_y):
+           q = (x · (Ly-1) + y) · Lz + z  for x∈[0,Lx), y∈[0,Ly-1), z∈[0,Lz)
+      - x-link qubits, positions [N_y, N_y + N_x):
+           q = N_y + (x · Ly + y) · Lz + z  for x∈[0,Lx-1), y∈[0,Ly), z∈[0,Lz)
+      - z-link qubits (3D only), positions [N_y+N_x, N_g):
+           q = N_y + N_x + (x · Ly + y) · (Lz-1) + z
+           for x∈[0,Lx), y∈[0,Ly), z∈[0,Lz-1)
+      - matter qubits, positions [N_g, NQ):
+           q = N_g + (x · Ly + y) · Lz + z  for x∈[0,Lx), y∈[0,Ly), z∈[0,Lz)
 
-    where N_y = Lx · (Ly-1), N_x = (Lx-1) · Ly, N_g = N_y + N_x.
+    where N_y = Lx·(Ly-1)·Lz, N_x = (Lx-1)·Ly·Lz, N_z = Lx·Ly·(Lz-1),
+          N_g = N_y + N_x + N_z.
+
+    At Lz=1: N_z=0 and z-axis multipliers degenerate, so y-link q = x·(Ly-1)+y,
+    x-link q = N_y + x·Ly + y, matter q = N_g + x·Ly + y — exact 2D layout.
     """
-    Lx, Ly = geom.Lx, geom.Ly
-    n_y = Lx * (Ly - 1)
-    n_x = (Lx - 1) * Ly
-    return (n_y + n_x, Lx * Ly)
+    Lx, Ly, Lz = geom.Lx, geom.Ly, geom.Lz
+    n_y = Lx * (Ly - 1) * Lz
+    n_x = (Lx - 1) * Ly * Lz
+    n_z = Lx * Ly * (Lz - 1)
+    return (n_y + n_x + n_z, Lx * Ly * Lz)
 
 
 def gauge_qc_bits_general(U: Z2GaugeConfig, t_slice: int,
                           geom: LatticeGeometry) -> int:
-    """Generalized 2×2 → arbitrary Lx × Ly OBC gauge-bit extractor.
+    """Generalized gauge-bit extractor for arbitrary Lx × Ly × Lz OBC.
 
-    Bit positions match qc_layout_counts() — y-links first (varying y inner,
-    x outer), then x-links (varying y inner, x outer).  Encoding σ=+1→0,
-    σ=−1→1.  Equivalent to gauge_qc_bits_from_slice at Lx=Ly=2 (bit-for-bit).
+    Bit positions match qc_layout_counts() — y-links first (z inner, y middle,
+    x outer), then x-links, then z-links (3D only).  Encoding σ=+1→0, σ=−1→1.
+    Equivalent to gauge_qc_bits_from_slice at Lx=Ly=2 Lz=1 (bit-for-bit).
     """
-    Lx, Ly = geom.Lx, geom.Ly
-    n_y = Lx * (Ly - 1)
+    Lx, Ly, Lz = geom.Lx, geom.Ly, geom.Lz
+    n_y = Lx * (Ly - 1) * Lz
+    n_x = (Lx - 1) * Ly * Lz
     bits = 0
+    # y-links
     for x in range(Lx):
         for y in range(Ly - 1):
-            pos = x * (Ly - 1) + y
-            b = 0 if U.U_y[t_slice, x, y] == 1 else 1
-            bits |= b << pos
+            for z in range(Lz):
+                pos = (x * (Ly - 1) + y) * Lz + z
+                if Lz == 1:
+                    sigma = U.U_y[t_slice, x, y]
+                else:
+                    sigma = U.U_y[t_slice, x, y, z]
+                bits |= (0 if sigma == 1 else 1) << pos
+    # x-links
     for x in range(Lx - 1):
         for y in range(Ly):
-            pos = n_y + x * Ly + y
-            b = 0 if U.U_x[t_slice, x, y] == 1 else 1
-            bits |= b << pos
+            for z in range(Lz):
+                pos = n_y + (x * Ly + y) * Lz + z
+                if Lz == 1:
+                    sigma = U.U_x[t_slice, x, y]
+                else:
+                    sigma = U.U_x[t_slice, x, y, z]
+                bits |= (0 if sigma == 1 else 1) << pos
+    # z-links (only when Lz > 1)
+    if Lz > 1:
+        for x in range(Lx):
+            for y in range(Ly):
+                for z in range(Lz - 1):
+                    pos = n_y + n_x + (x * Ly + y) * (Lz - 1) + z
+                    sigma = U.U_z[t_slice, x, y, z]
+                    bits |= (0 if sigma == 1 else 1) << pos
     return bits
 
 
