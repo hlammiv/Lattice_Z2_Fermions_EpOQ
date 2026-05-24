@@ -92,7 +92,7 @@ def _replica_advance_worker(args):
     """
     (geom_args, U_state, K_E, K_M, n_sweeps,
      rng_state, action_type, plaq_flip_every,
-     record, record_every, strang_M) = args
+     record, record_every, strang_M, temporal_gauge) = args
 
     # Pin BLAS to 1 thread and warm up Numba (same pattern as
     # `_chain_worker` in `action_z2_metropolis.py`).
@@ -126,11 +126,13 @@ def _replica_advance_worker(args):
         U, last_det, last_Sg, _n_acc = heatbath_sweep(
             geom, U, K=0.0, K_E=K_E, K_M=K_M, rng=rng,
             action_type=action_type, strang_M=strang_M,
+            temporal_gauge=temporal_gauge,
         )
         if plaq_flip_every > 0 and (sweep + 1) % plaq_flip_every == 0:
             U, last_det, last_Sg, _ = plaquette_flip_sweep(
                 geom, U, K=0.0, K_E=K_E, K_M=K_M, rng=rng,
                 action_type=action_type, strang_M=strang_M,
+                temporal_gauge=temporal_gauge,
             )
         if record and (sweep % record_every == 0):
             configs.append(Z2GaugeConfig(
@@ -184,6 +186,7 @@ def run_metropolis_pt(
     n_workers: int | None = None,
     verbose: bool = False,
     strang_M: bool = False,
+    temporal_gauge: bool = False,
 ) -> Tuple[List[MCMCResult], PTSwapStats]:
     """Run parallel-tempered Z_2 heat-bath MC across the K_E ladder.
 
@@ -219,6 +222,8 @@ def run_metropolis_pt(
             U_i = Z2GaugeConfig.trivial(geom)
         else:
             U_i = Z2GaugeConfig.random(geom, rng_i)
+            if temporal_gauge:
+                U_i.U_t[:] = 1   # fix U_t = +1 for temporal gauge MC
         replicas.append(U_i)
         rng_states.append(rng_i.bit_generator.state)
 
@@ -253,7 +258,7 @@ def run_metropolis_pt(
                  this_block_sweeps,
                  rng_states[i],
                  action_type, plaq_flip_every,
-                 recording, record_every, strang_M)
+                 recording, record_every, strang_M, temporal_gauge)
                 for i in range(N)
             ]
             block_out = pool.map(_replica_advance_worker, args_list)

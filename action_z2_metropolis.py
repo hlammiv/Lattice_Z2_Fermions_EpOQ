@@ -33,8 +33,12 @@ class MCMCResult:
     avg_sign: float = 0.0            # ⟨sign⟩ over recorded configs
 
 
-def link_list(geom: LatticeGeometry) -> list[tuple]:
-    """List all (link_type, t, x, y) tuples for sweep iteration. link_type ∈ {'x','y','t'}."""
+def link_list(geom: LatticeGeometry, temporal_gauge: bool = False) -> list[tuple]:
+    """List all (link_type, t, x, y) tuples for sweep iteration. link_type ∈ {'x','y','t'}.
+
+    temporal_gauge=True: skip 't' links (caller is responsible for U_t = +1 init).
+    Use when the EρOQ corner-state pipeline requires temporal-gauge basis labels.
+    """
     links = []
     for t in range(geom.N_E):
         for x in range(geom.Lx - 1):
@@ -44,10 +48,11 @@ def link_list(geom: LatticeGeometry) -> list[tuple]:
         for x in range(geom.Lx):
             for y in range(geom.Ly - 1):
                 links.append(('y', t, x, y))
-    for t in range(geom.N_E - 1):
-        for x in range(geom.Lx):
-            for y in range(geom.Ly):
-                links.append(('t', t, x, y))
+    if not temporal_gauge:
+        for t in range(geom.N_E - 1):
+            for x in range(geom.Lx):
+                for y in range(geom.Ly):
+                    links.append(('t', t, x, y))
     return links
 
 
@@ -104,6 +109,7 @@ def heatbath_sweep(
     rng: np.random.Generator = None,
     action_type: str = 'forward',
     strang_M: bool = False,
+    temporal_gauge: bool = False,
 ) -> tuple[Z2GaugeConfig, float, float, int]:
     """Per-link Z_2 heat-bath sweep.  100% acceptance: each link is sampled
     from its exact conditional P(U_l | others) ∝ exp(-S_g(U_l)) · |det M(U_l)|.
@@ -119,7 +125,7 @@ def heatbath_sweep(
     if K_M is None:
         K_M = K
     det_fn = _resolve_det_fn(action_type)
-    links = link_list(geom)
+    links = link_list(geom, temporal_gauge=temporal_gauge)
     rng.shuffle(links)
     n_flipped = 0
     cur_det = det_fn(geom, U)
@@ -153,6 +159,7 @@ def plaquette_flip_sweep(
     rng: np.random.Generator = None,
     action_type: str = 'forward',
     strang_M: bool = False,
+    temporal_gauge: bool = False,
 ) -> tuple[Z2GaugeConfig, float, float, int]:
     """Composite Metropolis move: flip all 4 links of a randomly-chosen
     plaquette simultaneously.  The plaquette itself is unchanged (sign(P)
@@ -236,6 +243,7 @@ def metropolis_sweep(
     rng: np.random.Generator = None,
     action_type: str = 'forward',
     strang_M: bool = False,
+    temporal_gauge: bool = False,
 ) -> tuple[Z2GaugeConfig, float, float, int]:
     """One Metropolis sweep over all links in random order. Returns updated U,
     final det M, final S_g, and number of accepts.
@@ -249,7 +257,7 @@ def metropolis_sweep(
     if K_M is None:
         K_M = K
     det_fn = _resolve_det_fn(action_type)
-    links = link_list(geom)
+    links = link_list(geom, temporal_gauge=temporal_gauge)
     rng.shuffle(links)
     n_accept = 0
     cur_det = det_fn(geom, U)
@@ -285,6 +293,7 @@ def run_metropolis(
     action_type: str = 'forward',
     plaq_flip_every: int = 0,
     strang_M: bool = False,
+    temporal_gauge: bool = False,
 ) -> MCMCResult:
     """Run Z₂ link Metropolis MC, recording config + observables.
 
@@ -305,8 +314,11 @@ def run_metropolis(
         U = Z2GaugeConfig.trivial(geom)
     else:
         U = Z2GaugeConfig.random(geom, rng)
+        if temporal_gauge:
+            # Force U_t = +1 for temporal gauge (only U_x, U_y sampled by MC)
+            U.U_t[:] = 1
 
-    n_links_per_sweep = len(link_list(geom))
+    n_links_per_sweep = len(link_list(geom, temporal_gauge=temporal_gauge))
 
     configs: List[Z2GaugeConfig] = []
     det_M_history = []
@@ -320,7 +332,7 @@ def run_metropolis(
     for sweep in range(n_warmup + n_sweeps):
         U, det_M, S_g, n_acc = heatbath_sweep(
             geom, U, K=K, K_E=K_E, K_M=K_M, rng=rng, action_type=action_type,
-            strang_M=strang_M)
+            strang_M=strang_M, temporal_gauge=temporal_gauge)
         n_accept_total += n_acc
         n_attempt_total += n_links_per_sweep
         # Optional composite move: plaquette-flip Metropolis every K sweeps.
@@ -330,7 +342,8 @@ def run_metropolis(
         if plaq_flip_every > 0 and (sweep + 1) % plaq_flip_every == 0:
             U, det_M, S_g, _ = plaquette_flip_sweep(
                 geom, U, K=K, K_E=K_E, K_M=K_M, rng=rng,
-                action_type=action_type, strang_M=strang_M)
+                action_type=action_type, strang_M=strang_M,
+                temporal_gauge=temporal_gauge)
         if sweep >= n_warmup and (sweep - n_warmup) % record_every == 0:
             U_copy = Z2GaugeConfig(
                 geom=geom,
