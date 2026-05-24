@@ -143,6 +143,115 @@ def build_pauli_terms() -> List[Term]:
     return terms
 
 
+def build_pauli_terms_general(
+    geom,
+    g_e: float = G_E,
+    g_m: float = G_M,
+    g_hop: float = G_HOP,
+    m_mass: float = None,
+) -> List[Term]:
+    """General H_QC builder for arbitrary L_x × L_y OBC.
+
+    At L_x = L_y = 2 this returns a Pauli decomposition equivalent to
+    build_pauli_terms() — same H, possibly different term ordering.  The
+    qubit layout is the natural extension of the 2×2 convention
+    (see action_minkowski_stitch.qc_layout_counts for the exact ordering):
+        q_yl(x,y) = x·(Ly−1) + y                          for x∈[0,Lx), y∈[0,Ly−1)
+        q_xl(x,y) = N_y + x·Ly + y                        for x∈[0,Lx−1), y∈[0,Ly)
+        q_m(x,y)  = N_g + x·Ly + y                        for x∈[0,Lx), y∈[0,Ly)
+
+    Hamiltonian (Kogut-Susskind staggered, time-fixed phases):
+        H_E   = −g_e Σ_l  X_l                              (over all link qubits)
+        H_M   = −g_m Σ_plaq  Z_{ℓ1} Z_{ℓ2} Z_{ℓ3} Z_{ℓ4}   (for each xy plaquette)
+        H_hop = Σ_(link l = pair a−b)  (η_l · g_hop / 2) · Z_l · JW(qa,qb) · (X_qa X_qb + Y_qa Y_qb)
+                with η_x = +1 on x-direction links, η_y = (−1)^x on y-direction links.
+        H_m   = m · Σ_site  (−1)^(x+y) · n_site
+              = m · Σ_site  (−1)^(x+y) · (I − Z_qm) / 2
+
+    JW(qa,qb) is the product of Z over all matter qubits with index
+    strictly between qa and qb (matter qubits are contiguous by construction).
+    """
+    if m_mass is None:
+        m_mass = M_MASS
+    Lx, Ly = geom.Lx, geom.Ly
+
+    n_y = Lx * (Ly - 1)
+    n_x = (Lx - 1) * Ly
+    n_g = n_y + n_x
+
+    def q_yl(x, y):
+        return x * (Ly - 1) + y
+
+    def q_xl(x, y):
+        return n_y + x * Ly + y
+
+    def q_m(x, y):
+        return n_g + x * Ly + y
+
+    terms: List[Term] = []
+
+    # --- Electric: −g_e Σ_l X_l ---------------------------------------------
+    for x in range(Lx):
+        for y in range(Ly - 1):
+            terms.append((complex(-g_e), [(q_yl(x, y), "X")]))
+    for x in range(Lx - 1):
+        for y in range(Ly):
+            terms.append((complex(-g_e), [(q_xl(x, y), "X")]))
+
+    # --- Magnetic plaquettes: −g_m Σ Z_{l1}Z_{l2}Z_{l3}Z_{l4} ----------------
+    # Plaquette at (x,y) for x∈[0,Lx−1), y∈[0,Ly−1) is bounded by
+    #   y-link (x,y), x-link (x,y+1), y-link (x+1,y), x-link (x,y).
+    for x in range(Lx - 1):
+        for y in range(Ly - 1):
+            qs = sorted([q_yl(x, y), q_xl(x, y + 1),
+                         q_yl(x + 1, y), q_xl(x, y)])
+            terms.append((complex(-g_m), [(q, "Z") for q in qs]))
+
+    def jw_string(qa, qb):
+        """Z on every matter qubit strictly between qa and qb (qa < qb)."""
+        return [(c, "Z") for c in range(qa + 1, qb)]
+
+    # --- Hopping y-links: η_y = (−1)^x --------------------------------------
+    for x in range(Lx):
+        for y in range(Ly - 1):
+            ql = q_yl(x, y)
+            qa, qb = q_m(x, y), q_m(x, y + 1)
+            if qa > qb:
+                qa, qb = qb, qa
+            eta = -1.0 if (x % 2) else 1.0
+            jw = jw_string(qa, qb)
+            coef = complex(eta * g_hop * 0.5)
+            terms.append((coef, [(ql, "Z")] + jw + [(qa, "X"), (qb, "X")]))
+            terms.append((coef, [(ql, "Z")] + jw + [(qa, "Y"), (qb, "Y")]))
+
+    # --- Hopping x-links: η_x = +1 ------------------------------------------
+    for x in range(Lx - 1):
+        for y in range(Ly):
+            ql = q_xl(x, y)
+            qa, qb = q_m(x, y), q_m(x + 1, y)
+            if qa > qb:
+                qa, qb = qb, qa
+            jw = jw_string(qa, qb)
+            coef = complex(g_hop * 0.5)
+            terms.append((coef, [(ql, "Z")] + jw + [(qa, "X"), (qb, "X")]))
+            terms.append((coef, [(ql, "Z")] + jw + [(qa, "Y"), (qb, "Y")]))
+
+    # --- Staggered mass: m · Σ (−1)^(x+y) n_site ----------------------------
+    const_shift = 0.0
+    for x in range(Lx):
+        for y in range(Ly):
+            qm = q_m(x, y)
+            sgn = 1.0 if ((x + y) % 2 == 0) else -1.0
+            const_shift += 0.5 * m_mass * sgn
+            terms.append((complex(-0.5 * m_mass * sgn), [(qm, "Z")]))
+    if abs(const_shift) > 1e-15:
+        terms.append((complex(const_shift), []))
+
+    # Drop zero-coefficient terms
+    terms = [(c, ops) for (c, ops) in terms if abs(c) > 0.0]
+    return terms
+
+
 # ---------------------------------------------------------------------------
 # Sparse Pauli-string application to a 256-element state vector
 # ---------------------------------------------------------------------------

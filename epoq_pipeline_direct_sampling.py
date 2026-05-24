@@ -45,17 +45,24 @@ size F×F = 2^(2·V_3) regardless of gauge-qubit count.
 
 Limitations
 ===========
-Current implementation requires V_3 = 4 with dense O_t per time.
-For V_3 ≥ 6 the dense O_t (= U(t)† n_0 U(t) n_0) grows past RAM
-and we'd want a matrix-free apply_O_t(v) interface — see
-project_3d_scaling_plan for Phase 40+ work.
+Accepts arbitrary Lx × Ly OBC (V_3 = Lx · Ly) with the qubit layout
+defined by `build_pauli_terms_general` / `gauge_qc_bits_general`
+(matter qubits at high bit positions, gauge link qubits at low).
+Caller is responsible for providing dense O_total_dict[t] = U(t)†·n_0·U(t)·n_0
+matrices of shape (DIM, DIM) where DIM = 2^(N_gauge + V_3).
+For V_3 ≥ 8 the dense O_t grows past RAM and we'd want a matrix-free
+apply_O_t(v) interface — see project_3d_scaling_plan for Phase 41+.
 """
 from __future__ import annotations
 import numpy as np
 
 from action_z2_staggered import LatticeGeometry
 from action_corner_direct_v3 import _fock_index_to_psi_map
-from action_minkowski_stitch import gauge_qc_bits_from_slice
+from action_minkowski_stitch import (
+    gauge_qc_bits_from_slice,
+    gauge_qc_bits_general,
+    qc_layout_counts,
+)
 from transfer_matrix_kbc_trotterized import compute_combined_weight_trotter
 
 
@@ -91,16 +98,20 @@ def accumulate_C_direct(
         n_configs: int               — number of configs processed
     """
     V3 = geom.V_3
-    if V3 != 4:
-        raise NotImplementedError(
-            f"accumulate_C_direct currently supports V_3=4 only; got V_3={V3}. "
-            f"For V_3>=6 see project_3d_scaling_plan Phase 40+ (matrix-free O_t)."
-        )
+    F = 1 << V3
+    n_gauge_qubits, _ = qc_layout_counts(geom)
+    G = 1 << n_gauge_qubits
+    DIM = F * G
 
-    F = 1 << V3                  # fermion sector dim per slice = 16
-    NQ_GAUGE = 8 - V3            # 4 gauge link qubits in V_3=4 2x2 case
-    G = 1 << NQ_GAUGE            # gauge bit count = 16
-    DIM = F * G                  # 256
+    # Pick the gauge-bit extractor that matches the qubit layout.
+    # 2×2 keeps the legacy gauge_qc_bits_from_slice so V_3=4 scripts get
+    # exact backward compatibility (and the legacy build_pauli_terms layout
+    # is preserved bit-for-bit).
+    if geom.Lx == 2 and geom.Ly == 2:
+        gauge_extractor = gauge_qc_bits_from_slice
+    else:
+        def gauge_extractor(U, t_slice):
+            return gauge_qc_bits_general(U, t_slice, geom)
 
     idx_to_psi = _fock_index_to_psi_map(V3)
     # Vectorize the psi-permutation: W_psi = P @ W_full @ P.T where
@@ -110,8 +121,8 @@ def accumulate_C_direct(
         P[idx_to_psi[li], li] = 1.0
 
     # Reshape each O_t into (F, G, F, G).
-    # O_reshaped[pt, g_top, pb, g_bot] = O[(pt<<4)|g_top, (pb<<4)|g_bot]
-    # (default C-order: last axis varies fastest)
+    # Default C-order with index = (matter << n_gauge_qubits) | gauge gives
+    # O_reshaped[pt, g_top, pb, g_bot] = O[(pt<<n_gauge)|g_top, (pb<<n_gauge)|g_bot]
     O_reshaped = {}
     for t in times:
         O = O_total_dict[t]
@@ -136,8 +147,8 @@ def accumulate_C_direct(
         )
         W_psi = P @ W_full @ P.T
 
-        g_top = gauge_qc_bits_from_slice(U, geom.N_E - 1)
-        g_bot = gauge_qc_bits_from_slice(U, 0)
+        g_top = gauge_extractor(U, geom.N_E - 1)
+        g_bot = gauge_extractor(U, 0)
 
         if g_top == g_bot:
             C_denom += np.trace(W_psi).real
@@ -173,16 +184,23 @@ def assemble_rho_dense(
     """Reference path: same as the inline ρ̃ assembly in check_beta4_*.py.
 
     Returned ρ̃ is NOT Hermitized — caller does (ρ̃ + ρ̃†)/2 if desired.
-    Provided here so the identity check can compute C(t) from the dense
-    ρ̃ side using exactly the same numerical conventions.
+    Provided so the identity check can compute C(t) from the dense ρ̃
+    using exactly the same numerical conventions.  At V_3 > 4 the
+    DIM × DIM array can be huge (memory wall this refactor exists to avoid);
+    expect to use it only as a V_3=4 reference.
     """
     V3 = geom.V_3
-    if V3 != 4:
-        raise NotImplementedError("assemble_rho_dense: V_3=4 only.")
     F = 1 << V3
-    G = 1 << (8 - V3)
+    n_gauge_qubits, _ = qc_layout_counts(geom)
+    G = 1 << n_gauge_qubits
     DIM = F * G
     idx_to_psi = _fock_index_to_psi_map(V3)
+
+    if geom.Lx == 2 and geom.Ly == 2:
+        gauge_extractor = gauge_qc_bits_from_slice
+    else:
+        def gauge_extractor(U, t_slice):
+            return gauge_qc_bits_general(U, t_slice, geom)
 
     rho = np.zeros((DIM, DIM), dtype=complex)
     for U in configs:
@@ -194,11 +212,11 @@ def assemble_rho_dense(
         for li in range(F):
             for lj in range(F):
                 W_psi[idx_to_psi[li], idx_to_psi[lj]] = W_full[li, lj]
-        g_top = gauge_qc_bits_from_slice(U, geom.N_E - 1)
-        g_bot = gauge_qc_bits_from_slice(U, 0)
+        g_top = gauge_extractor(U, geom.N_E - 1)
+        g_bot = gauge_extractor(U, 0)
         for pt in range(F):
             for pb in range(F):
-                bit_a = (pt << 4) | g_top
-                bit_b = (pb << 4) | g_bot
+                bit_a = (pt << n_gauge_qubits) | g_top
+                bit_b = (pb << n_gauge_qubits) | g_bot
                 rho[bit_a, bit_b] += W_psi[pt, pb]
     return rho

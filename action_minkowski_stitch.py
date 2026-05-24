@@ -27,10 +27,14 @@ from action_z2_staggered import LatticeGeometry, Z2GaugeConfig
 def gauge_qc_bits_from_slice(U: Z2GaugeConfig, t_slice: int) -> int:
     """Extract 4-bit QC link-qubit value from gauge config at temporal slice t_slice.
 
-    Layout per z2_setup.py convention:
+    Layout per z2_setup.py convention (2×2 OBC only):
       q0 = U_y[t, 0, 0],  q1 = U_y[t, 1, 0],
       q2 = U_x[t, 0, 0],  q3 = U_x[t, 0, 1].
     Encoding: σ = +1 → bit 0,  σ = −1 → bit 1.
+
+    For general Lx × Ly use gauge_qc_bits_general instead — this function
+    is kept for backward-compatible 2×2 production scripts (gives the
+    same bit string as the general version on 2×2).
     """
     def bit(σ):
         return 0 if σ == 1 else 1
@@ -39,6 +43,49 @@ def gauge_qc_bits_from_slice(U: Z2GaugeConfig, t_slice: int) -> int:
     b2 = bit(U.U_x[t_slice, 0, 0])
     b3 = bit(U.U_x[t_slice, 0, 1])
     return b0 | (b1 << 1) | (b2 << 2) | (b3 << 3)
+
+
+def qc_layout_counts(geom: LatticeGeometry) -> tuple[int, int]:
+    """Return (n_gauge_qubits, n_matter_qubits) for the general qubit layout.
+
+    Layout (extends the 2×2 convention; identical bit positions at Lx=Ly=2):
+      - y-link qubits, positions [0, N_y):     q = x * (Ly - 1) + y
+                                                for x ∈ [0,Lx), y ∈ [0,Ly-1)
+      - x-link qubits, positions [N_y, N_g):   q = N_y + x * Ly + y
+                                                for x ∈ [0,Lx-1), y ∈ [0,Ly)
+      - matter qubits, positions [N_g, NQ):    q = N_g + x * Ly + y
+                                                for x ∈ [0,Lx), y ∈ [0,Ly)
+
+    where N_y = Lx · (Ly-1), N_x = (Lx-1) · Ly, N_g = N_y + N_x.
+    """
+    Lx, Ly = geom.Lx, geom.Ly
+    n_y = Lx * (Ly - 1)
+    n_x = (Lx - 1) * Ly
+    return (n_y + n_x, Lx * Ly)
+
+
+def gauge_qc_bits_general(U: Z2GaugeConfig, t_slice: int,
+                          geom: LatticeGeometry) -> int:
+    """Generalized 2×2 → arbitrary Lx × Ly OBC gauge-bit extractor.
+
+    Bit positions match qc_layout_counts() — y-links first (varying y inner,
+    x outer), then x-links (varying y inner, x outer).  Encoding σ=+1→0,
+    σ=−1→1.  Equivalent to gauge_qc_bits_from_slice at Lx=Ly=2 (bit-for-bit).
+    """
+    Lx, Ly = geom.Lx, geom.Ly
+    n_y = Lx * (Ly - 1)
+    bits = 0
+    for x in range(Lx):
+        for y in range(Ly - 1):
+            pos = x * (Ly - 1) + y
+            b = 0 if U.U_y[t_slice, x, y] == 1 else 1
+            bits |= b << pos
+    for x in range(Lx - 1):
+        for y in range(Ly):
+            pos = n_y + x * Ly + y
+            b = 0 if U.U_x[t_slice, x, y] == 1 else 1
+            bits |= b << pos
+    return bits
 
 
 def qc_basis_index(geom: LatticeGeometry, U: Z2GaugeConfig,
