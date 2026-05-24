@@ -253,6 +253,84 @@ def build_pauli_terms_general(
 
 
 # ---------------------------------------------------------------------------
+# Sparse H_QC and n_0 builders for V_3 >= 6 (Phase 41 sparse ED)
+# ---------------------------------------------------------------------------
+
+def build_sparse_H_QC(
+    geom,
+    g_e: float = G_E,
+    g_m: float = G_M,
+    g_hop: float = G_HOP,
+    m_mass: float = None,
+):
+    """Sparse CSR Hamiltonian for any Lx × Ly OBC.
+
+    Sums per-Pauli-string sparse matrices.  Each Pauli string has nnz = dim
+    (X-type strings are permutations; Z-only strings are diagonal).  After
+    sum_duplicates the total nnz is bounded by (distinct x_masks) · dim,
+    which scales as O(V_3 · dim) — feasible up to V_3 = 8 3D (dim 2^20).
+
+    Used by epoq_sparse_ed.compute_C_t_hutchinson to avoid building a
+    dense (dim, dim) Hamiltonian when dim exceeds the dense ED budget.
+    """
+    import scipy.sparse as sp
+    from action_minkowski_stitch import qc_layout_counts
+
+    if m_mass is None:
+        m_mass = M_MASS
+
+    n_gauge, n_matter = qc_layout_counts(geom)
+    nq = n_gauge + n_matter
+    dim = 1 << nq
+
+    P2_sp = {
+        'I': sp.eye(2, dtype=complex, format='csr'),
+        'X': sp.csr_matrix(np.array([[0, 1], [1, 0]], dtype=complex)),
+        'Y': sp.csr_matrix(np.array([[0, -1j], [1j, 0]], dtype=complex)),
+        'Z': sp.csr_matrix(np.diag([1.0, -1.0]).astype(complex)),
+    }
+
+    def pauli_string_sparse(factors):
+        by_q = {q: P2_sp['I'] for q in range(nq)}
+        for q, ax in factors:
+            by_q[q] = P2_sp[ax]
+        # kron from q = nq-1 down to q = 0 (matches the dense build's
+        # outer-MSB-to-inner-LSB convention)
+        r = by_q[nq - 1]
+        for q in range(nq - 2, -1, -1):
+            r = sp.kron(r, by_q[q], format='csr')
+        return r
+
+    terms = build_pauli_terms_general(
+        geom, g_e=g_e, g_m=g_m, g_hop=g_hop, m_mass=m_mass)
+
+    H = sp.csr_matrix((dim, dim), dtype=complex)
+    for coef, factors in terms:
+        if not factors:
+            H = H + coef * sp.eye(dim, dtype=complex, format='csr')
+        else:
+            H = H + coef * pauli_string_sparse(factors)
+    # Symmetrize defensively (should already be exact for our real
+    # Pauli decomposition since H is real-symmetric in some basis).
+    H = (H + H.conj().T) * 0.5
+    return H.tocsr()
+
+
+def build_sparse_n0_at_site00(geom):
+    """Sparse diagonal n_0 = (I - Z_{q_m(0,0)}) / 2 — occupation at
+    site (0,0).  q_m(0,0) = n_gauge in the qc_layout_counts convention.
+    """
+    import scipy.sparse as sp
+    from action_minkowski_stitch import qc_layout_counts
+    n_gauge, n_matter = qc_layout_counts(geom)
+    nq = n_gauge + n_matter
+    dim = 1 << nq
+    q = n_gauge
+    diag = ((np.arange(dim, dtype=np.int64) >> q) & 1).astype(complex)
+    return sp.diags(diag, format='csr')
+
+
+# ---------------------------------------------------------------------------
 # Sparse Pauli-string application to a 256-element state vector
 # ---------------------------------------------------------------------------
 
