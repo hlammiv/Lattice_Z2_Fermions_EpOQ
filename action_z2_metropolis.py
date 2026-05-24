@@ -34,36 +34,67 @@ class MCMCResult:
 
 
 def link_list(geom: LatticeGeometry, temporal_gauge: bool = False) -> list[tuple]:
-    """List all (link_type, t, x, y) tuples for sweep iteration. link_type ∈ {'x','y','t'}.
+    """List all (link_type, t, x, y, z) tuples for sweep iteration.
 
-    temporal_gauge=True: skip 't' links (caller is responsible for U_t = +1 init).
-    Use when the EρOQ corner-state pipeline requires temporal-gauge basis labels.
+    link_type ∈ {'x','y','t'} at Lz=1 (z is always 0 in the tuple — kept
+    for unified unpacking).  At Lz>1 also includes 'z' link_type for
+    z-direction spatial links.  temporal_gauge=True: skip 't' links.
+
+    Pre-shuffle ordering matches the original 2D structure (all x-links
+    across t, then all y-links, then z-links if Lz>1, then t-links if not
+    temporal_gauge).  Together with z=0 always at Lz=1, this preserves
+    bit-for-bit MC trajectories vs the pre-3D code for any 2D run.
     """
     links = []
-    for t in range(geom.N_E):
-        for x in range(geom.Lx - 1):
-            for y in range(geom.Ly):
-                links.append(('x', t, x, y))
-    for t in range(geom.N_E):
-        for x in range(geom.Lx):
-            for y in range(geom.Ly - 1):
-                links.append(('y', t, x, y))
+    Lx, Ly, Lz, N_E = geom.Lx, geom.Ly, geom.Lz, geom.N_E
+    for t in range(N_E):
+        for x in range(Lx - 1):
+            for y in range(Ly):
+                for z in range(Lz):
+                    links.append(('x', t, x, y, z))
+    for t in range(N_E):
+        for x in range(Lx):
+            for y in range(Ly - 1):
+                for z in range(Lz):
+                    links.append(('y', t, x, y, z))
+    if Lz > 1:
+        for t in range(N_E):
+            for x in range(Lx):
+                for y in range(Ly):
+                    for z in range(Lz - 1):
+                        links.append(('z', t, x, y, z))
     if not temporal_gauge:
-        for t in range(geom.N_E - 1):
-            for x in range(geom.Lx):
-                for y in range(geom.Ly):
-                    links.append(('t', t, x, y))
+        for t in range(N_E - 1):
+            for x in range(Lx):
+                for y in range(Ly):
+                    for z in range(Lz):
+                        links.append(('t', t, x, y, z))
     return links
 
 
-def flip_link(U: Z2GaugeConfig, link_type: str, t: int, x: int, y: int) -> None:
-    """In-place flip of σ ↔ -σ at the specified link."""
+def flip_link(U: Z2GaugeConfig, link_type: str,
+              t: int, x: int, y: int, z: int = 0) -> None:
+    """In-place flip σ ↔ -σ at the specified link.  z arg ignored at Lz=1."""
+    Lz = U.geom.Lz
     if link_type == 'x':
-        U.U_x[t, x, y] *= -1
+        if Lz == 1:
+            U.U_x[t, x, y] *= -1
+        else:
+            U.U_x[t, x, y, z] *= -1
     elif link_type == 'y':
-        U.U_y[t, x, y] *= -1
+        if Lz == 1:
+            U.U_y[t, x, y] *= -1
+        else:
+            U.U_y[t, x, y, z] *= -1
     elif link_type == 't':
-        U.U_t[t, x, y] *= -1
+        if Lz == 1:
+            U.U_t[t, x, y] *= -1
+        else:
+            U.U_t[t, x, y, z] *= -1
+    elif link_type == 'z':
+        if Lz == 1:
+            raise ValueError("link_type 'z' is invalid at Lz=1")
+        U.U_z[t, x, y, z] *= -1
     else:
         raise ValueError(link_type)
 
@@ -130,10 +161,10 @@ def heatbath_sweep(
     n_flipped = 0
     cur_det = det_fn(geom, U)
     cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
-    for link_type, t, x, y in links:
+    for link_type, t, x, y, z in links:
         det_cur = cur_det
         Sg_cur = cur_Sg
-        flip_link(U, link_type, t, x, y)
+        flip_link(U, link_type, t, x, y, z)
         det_flip = det_fn(geom, U)
         Sg_flip = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
         # Compute conditional probability of FLIPPED state
@@ -148,7 +179,7 @@ def heatbath_sweep(
             cur_det, cur_Sg = det_flip, Sg_flip
             n_flipped += 1
         else:
-            flip_link(U, link_type, t, x, y)  # revert (so unchanged)
+            flip_link(U, link_type, t, x, y, z)  # revert (so unchanged)
     return U, cur_det, cur_Sg, n_flipped
 
 
@@ -168,11 +199,17 @@ def plaquette_flip_sweep(
 
     Proposes one xy (magnetic) and one xτ and one yτ plaquette flip per
     sweep iteration.  Each is its own inverse → detailed balance trivial.
+
+    Lz>1 not yet supported (would need xz/yz/zτ flippers); error out.
     """
     if K_E is None:
         K_E = K
     if K_M is None:
         K_M = K
+    if geom.Lz != 1:
+        raise NotImplementedError(
+            f"plaquette_flip_sweep: 3D (Lz={geom.Lz}) not yet supported. "
+            f"Use single-link metropolis_sweep, which is 3D-aware.")
     det_fn = _resolve_det_fn(action_type)
 
     Lx, Ly, N_E = geom.Lx, geom.Ly, geom.N_E
@@ -262,8 +299,8 @@ def metropolis_sweep(
     n_accept = 0
     cur_det = det_fn(geom, U)
     cur_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
-    for link_type, t, x, y in links:
-        flip_link(U, link_type, t, x, y)
+    for link_type, t, x, y, z in links:
+        flip_link(U, link_type, t, x, y, z)
         new_det = det_fn(geom, U)
         new_Sg = gauge_action(geom, U, K=K, K_E=K_E, K_M=K_M, strang_M=strang_M)
         # Use |det M| in the weight; the sign is recorded for reweighting.
@@ -278,7 +315,7 @@ def metropolis_sweep(
             cur_det, cur_Sg = new_det, new_Sg
             n_accept += 1
         else:
-            flip_link(U, link_type, t, x, y)  # revert
+            flip_link(U, link_type, t, x, y, z)  # revert
     return U, cur_det, cur_Sg, n_accept
 
 
@@ -350,6 +387,7 @@ def run_metropolis(
                 U_x=U.U_x.copy(),
                 U_y=U.U_y.copy(),
                 U_t=U.U_t.copy(),
+                U_z=(U.U_z.copy() if U.U_z is not None else None),
             )
             configs.append(U_copy)
             det_M_history.append(det_M)

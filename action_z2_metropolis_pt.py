@@ -205,6 +205,12 @@ def run_metropolis_pt(
     K_E_ladder = list(map(float, K_E_ladder))
     if any(K_E_ladder[i] >= K_E_ladder[i + 1] for i in range(len(K_E_ladder) - 1)):
         raise ValueError("K_E_ladder must be strictly ascending.")
+    if geom.Lz != 1:
+        raise NotImplementedError(
+            f"run_metropolis_pt: 3D (Lz={geom.Lz}) not yet supported. "
+            f"The PT worker serialization of Z2GaugeConfig + the geom_args "
+            f"dict need to carry U_z and Lz.  Use action_z2_metropolis."
+            f"run_metropolis (single-chain) for 3D smoke runs.")
     N = len(K_E_ladder)
     if n_workers is None:
         n_workers = min(N, 16)
