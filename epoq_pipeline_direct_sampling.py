@@ -107,7 +107,7 @@ def accumulate_C_direct(
     # 2×2 keeps the legacy gauge_qc_bits_from_slice so V_3=4 scripts get
     # exact backward compatibility (and the legacy build_pauli_terms layout
     # is preserved bit-for-bit).
-    if geom.Lx == 2 and geom.Ly == 2:
+    if geom.Lx == 2 and geom.Ly == 2 and geom.Lz == 1:
         gauge_extractor = gauge_qc_bits_from_slice
     else:
         def gauge_extractor(U, t_slice):
@@ -238,7 +238,7 @@ def accumulate_C_direct_slab(
 
     q_n0 = n_gauge_qubits  # matter site (0,0) qubit position
 
-    if geom.Lx == 2 and geom.Ly == 2:
+    if geom.Lx == 2 and geom.Ly == 2 and geom.Lz == 1:
         gauge_extractor = gauge_qc_bits_from_slice
     else:
         def gauge_extractor(U, t_slice):
@@ -372,90 +372,96 @@ def accumulate_C_direct_slab(
               f"(Phase 1 total {_time.time()-t1:.1f}s).", flush=True)
     unique_g_list = sorted(unique_g)
 
-    # -- Phase 2: per unique g and per t, build E[g, t] (DIM, F/2)
+    # -- Phase 2+3 fused (streaming over g): build E[g, t] for one g at
+    # a time, contract immediately with all configs that need it, then
+    # release E.  RAM is bounded by O(DIM · F/2 · |times|) per g
+    # instead of |unique_g| · DIM · F/2 · |times| in the all-at-once
+    # cache scheme.  At 3D 2×2×2 dim=1M F/2=128: per-g E = 2 GB; the
+    # all-at-once approach would need |unique_g| × |t| × 2 GB ≫ RAM.
     surviving_pb = np.array([pb for pb in range(F) if (pb & 1)],
                             dtype=np.int64)
     n_surv = len(surviving_pb)
 
     n0_diag = ((np.arange(DIM, dtype=np.int64) >> q_n0) & 1).astype(complex)
 
-    if progress:
-        print(f"  Phase 2: O_t cache  ({len(unique_g)} g × {len(times)} t × "
-              f"2 sparse expm calls each)...", flush=True)
-    t2 = _time.time()
+    # Group config indices by their g_top and g_bot.
+    configs_by_g_top = {}   # g_value -> list of config indices i where g_top_i == g
+    configs_by_g_bot = {}
+    for i in range(n_configs):
+        configs_by_g_top.setdefault(config_g_top[i], []).append(i)
+        configs_by_g_bot.setdefault(config_g_bot[i], []).append(i)
 
-    E_cache = {}  # (g, t) -> (DIM, F/2) dense complex
+    # Trace denominator: configs with g_top == g_bot.  One-time pass.
+    C_denom = 0.0
+    for i in range(n_configs):
+        if config_g_top[i] == config_g_bot[i]:
+            C_denom += np.trace(config_W_psi[i]).real
+
+    if progress:
+        print(f"  Phase 2+3 (streaming): {len(unique_g_list)} unique g × "
+              f"{len(times)} t × 2 sparse expm calls each ...", flush=True)
+    t23 = _time.time()
+
+    Trho_O = {t: 0.0 + 0.0j for t in times}
     for g_idx, g in enumerate(unique_g_list):
-        # Build (DIM, n_surv) RHS B: one unit vector per surviving pb at gauge g.
+        # Build (DIM, n_surv) RHS B for this g.
         B = np.zeros((DIM, n_surv), dtype=complex)
         for k, pb in enumerate(surviving_pb):
             B[(pb << n_gauge_qubits) | g, k] = 1.0
+
         for t in times:
             if t == 0.0:
                 # U(0) = I → E = n_0 · B = n0_diag[:, None] * B
                 E = n0_diag[:, None] * B
             else:
-                # Apply U(t):
                 C_mat = expm_multiply(-1j * t * H_sparse, B)
-                # Apply middle n_0 (diagonal):
                 C_mat *= n0_diag[:, None]
-                # Apply U(t)†:
                 E = expm_multiply(+1j * t * H_sparse, C_mat)
-            E_cache[(g, t)] = E
 
+            # Now contract E (= E[g, t], "right gauge" = g) with all configs
+            # that use it.  Two cases:
+            # (a) g_top_i == g: this E backs the O_sub_bot_top piece for config i,
+            #     since O_sub_bot_top[pb, pt] = O_t[(pb<<n_g)|g_bot_i, (pt<<n_g)|g_top]
+            #     and the right gauge is g_top == g.
+            #     partial_bt[m, k] = E[(m<<n_g)|g_bot_i, k] = O_t[..., (pb(k)<<n_g)|g]
+            #     → O_sub_bot_top: re-embed across pb.
+            for i in configs_by_g_top.get(g, ()):
+                W_psi = config_W_psi[i]
+                g_bot_i = config_g_bot[i]
+                partial_bt = E[g_bot_i::G, :]   # (F, F/2)
+                O_sub_bot_top = np.zeros((F, F), dtype=complex)
+                O_sub_bot_top[:, surviving_pb] = partial_bt
+                tr_rho_O = np.trace(W_psi @ O_sub_bot_top)
+                Trho_O[t] += 0.5 * tr_rho_O
+
+            # (b) g_bot_i == g: this E backs the O_sub_top_bot piece.
+            #     O_sub_top_bot[pt, pb] = O_t[(pt<<n_g)|g_top_i, (pb<<n_g)|g_bot_i=g]
+            #     partial_tb[m, k] = E[(m<<n_g)|g_top_i, k] = O_t[..., (pb(k)<<n_g)|g]
+            for i in configs_by_g_bot.get(g, ()):
+                W_psi = config_W_psi[i]
+                g_top_i = config_g_top[i]
+                partial_tb = E[g_top_i::G, :]   # (F, F/2)
+                O_sub_top_bot = np.zeros((F, F), dtype=complex)
+                O_sub_top_bot[:, surviving_pb] = partial_tb
+                tr_rho_dag_O = np.sum(W_psi.conj() * O_sub_top_bot)
+                Trho_O[t] += 0.5 * tr_rho_dag_O
+
+            # E and intermediate arrays go out of scope at end of t loop;
+            # garbage collected before the next t (or next g).
+            del E
+            if t != 0.0:
+                del C_mat
+
+        del B   # free per-g RHS
         if progress and ((g_idx + 1) % progress_every == 0
                          or g_idx == len(unique_g_list) - 1):
-            elapsed = _time.time() - t2
+            elapsed = _time.time() - t23
             eta = elapsed / (g_idx + 1) * (len(unique_g_list) - g_idx - 1)
             print(f"    g {g_idx+1}/{len(unique_g_list)}: "
                   f"elapsed {elapsed:.1f}s, ETA {eta:.1f}s", flush=True)
 
     if progress:
-        print(f"  Phase 2 done in {_time.time()-t2:.1f}s.", flush=True)
-
-    # -- Phase 3: per config, lookup, extract submatrices, contract.
-    if progress:
-        print("  Phase 3: contracting per-config...", flush=True)
-    t3 = _time.time()
-
-    C_denom = 0.0
-    Trho_O = {t: 0.0 + 0.0j for t in times}
-
-    for i in range(n_configs):
-        W_psi = config_W_psi[i]
-        g_top = config_g_top[i]
-        g_bot = config_g_bot[i]
-
-        if g_top == g_bot:
-            C_denom += np.trace(W_psi).real
-
-        for t in times:
-            # E[g_bot, t][g_top::G, :]   gives the (F, F/2) partial:
-            #   E_for_pb_at_g_bot[g_top::G, k] = O_t[(pt<<n_g)|g_top, (pb(k)<<n_g)|g_bot]
-            # So this is the O_sub_top_bot piece (no transpose).
-            E_g_bot = E_cache[(g_bot, t)]
-            partial_tb = E_g_bot[g_top::G, :]  # (F, F/2)
-            O_sub_top_bot = np.zeros((F, F), dtype=complex)
-            O_sub_top_bot[:, surviving_pb] = partial_tb
-
-            # E[g_top, t][g_bot::G, :]  gives the (F, F/2) partial:
-            #   E_for_pb_at_g_top[g_bot::G, k] = O_t[(pt<<n_g)|g_bot, (pb(k)<<n_g)|g_top]
-            # Note: index name "pt" here is the matter sector of the FIRST argument
-            # which is the BRA side g_bot.  We then transpose to get pb,pt order
-            # consistent with how accumulate_C_direct uses O_sub_bot_top.
-            E_g_top = E_cache[(g_top, t)]
-            partial_bt = E_g_top[g_bot::G, :]   # (F, F/2)
-            # partial_bt[m, k] = O_t[(m<<n_g)|g_bot, (surviving_pb[k]<<n_g)|g_top]
-            # Re-embed across full pb axis:
-            O_sub_bot_top = np.zeros((F, F), dtype=complex)
-            O_sub_bot_top[:, surviving_pb] = partial_bt
-
-            tr_rho_O = np.trace(W_psi @ O_sub_bot_top)
-            tr_rho_dag_O = np.sum(W_psi.conj() * O_sub_top_bot)
-            Trho_O[t] += 0.5 * (tr_rho_O + tr_rho_dag_O)
-
-    if progress:
-        print(f"  Phase 3 done in {_time.time()-t3:.1f}s.", flush=True)
+        print(f"  Phase 2+3 done in {_time.time()-t23:.1f}s.", flush=True)
 
     if C_denom == 0.0:
         raise RuntimeError(
@@ -489,7 +495,7 @@ def assemble_rho_dense(
     DIM = F * G
     idx_to_psi = _fock_index_to_psi_map(V3)
 
-    if geom.Lx == 2 and geom.Ly == 2:
+    if geom.Lx == 2 and geom.Ly == 2 and geom.Lz == 1:
         gauge_extractor = gauge_qc_bits_from_slice
     else:
         def gauge_extractor(U, t_slice):
