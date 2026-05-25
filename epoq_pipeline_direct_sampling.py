@@ -185,6 +185,7 @@ def accumulate_C_direct_slab(
     require_temporal_gauge: bool = True,
     progress: bool = True,
     progress_every: int = 32,
+    expm_batch_size: int = None,
 ):
     """Slab-projected accumulator: never materializes the dense (DIM, DIM) O_t.
 
@@ -402,6 +403,26 @@ def accumulate_C_direct_slab(
               f"{len(times)} t × 2 sparse expm calls each ...", flush=True)
     t23 = _time.time()
 
+    # Choose batch size to keep scipy expm_multiply's hidden workspace
+    # bounded.  scipy's Higham&Al-Mohy expm_multiply allocates several
+    # (n, k) work matrices internally, and empirically the total memory
+    # footprint at large n is ~30×16×n×k bytes (verified by OOM at
+    # n=2^20 k=128 hitting 27 GB total-vm).  Pick batch so that the
+    # transient peak stays under ~3 GB above the steady-state E array:
+    #     k_max ≈ 3e9 / (30 × 16 × n) ≈ 6.25e6 / n.
+    # At n=2^20=1M → k_max ≈ 6.  At n=2^18=262K → k_max ≈ 24.
+    # At V_3=6 dim=8192 → k_max ≈ 760 (no batching needed).
+    if expm_batch_size is None:
+        max_k = max(1, int(3e9 / (30 * 16 * DIM)))
+        expm_batch_size = min(n_surv, max(1, max_k))
+    expm_batch_size = int(expm_batch_size)
+
+    if progress:
+        print(f"    column-batch size: {expm_batch_size} "
+              f"(of n_surv={n_surv}, "
+              f"{(n_surv + expm_batch_size - 1) // expm_batch_size} batches/g/t)",
+              flush=True)
+
     Trho_O = {t: 0.0 + 0.0j for t in times}
     for g_idx, g in enumerate(unique_g_list):
         # Build (DIM, n_surv) RHS B for this g.
@@ -414,9 +435,16 @@ def accumulate_C_direct_slab(
                 # U(0) = I → E = n_0 · B = n0_diag[:, None] * B
                 E = n0_diag[:, None] * B
             else:
-                C_mat = expm_multiply(-1j * t * H_sparse, B)
-                C_mat *= n0_diag[:, None]
-                E = expm_multiply(+1j * t * H_sparse, C_mat)
+                # Build E in column batches to bound scipy's memory.
+                E = np.empty((DIM, n_surv), dtype=complex)
+                for b_start in range(0, n_surv, expm_batch_size):
+                    b_end = min(b_start + expm_batch_size, n_surv)
+                    B_batch = B[:, b_start:b_end]
+                    C_batch = expm_multiply(-1j * t * H_sparse, B_batch)
+                    C_batch *= n0_diag[:, None]
+                    E[:, b_start:b_end] = expm_multiply(
+                        +1j * t * H_sparse, C_batch)
+                    del C_batch
 
             # Now contract E (= E[g, t], "right gauge" = g) with all configs
             # that use it.  Two cases:
@@ -449,8 +477,6 @@ def accumulate_C_direct_slab(
             # E and intermediate arrays go out of scope at end of t loop;
             # garbage collected before the next t (or next g).
             del E
-            if t != 0.0:
-                del C_mat
 
         del B   # free per-g RHS
         if progress and ((g_idx + 1) % progress_every == 0
