@@ -508,6 +508,297 @@ def accumulate_C_direct_slab(
     return C, C_denom, Trho_O, n_configs
 
 
+# ---------------------------------------------------------------------------
+# Parallel Phase 2+3 via multiprocessing.Pool (fork) across unique g.
+# Each worker processes one g end-to-end: build B, build E per t, contract,
+# return per-t partial Trho_O complex sum.  H_sparse and other heavy
+# read-only state are inherited via fork copy-on-write (no per-task pickle
+# of the ~400 MB sparse H).
+# ---------------------------------------------------------------------------
+
+_PARALLEL_STATE = {}
+
+
+def _set_parallel_state(**kwargs):
+    """Stash read-only state in a module-level dict so workers can access
+    it via fork() inheritance without per-task pickle overhead."""
+    _PARALLEL_STATE.clear()
+    _PARALLEL_STATE.update(kwargs)
+
+
+def _worker_phase23_one_g(task):
+    """Phase 2+3 work for a single unique g.
+
+    task = (g, times, configs_g_top, configs_g_bot)
+      configs_g_top: list of (g_bot_i, W_psi_i)  — configs where g_top_i == g
+      configs_g_bot: list of (g_top_i, W_psi_i)  — configs where g_bot_i == g
+
+    Returns: {t: complex partial Trho_O contribution from this g}
+    """
+    import numpy as _np
+    from scipy.sparse.linalg import expm_multiply as _expm_multiply
+
+    g, times, configs_g_top, configs_g_bot = task
+    H_sparse = _PARALLEL_STATE['H_sparse']
+    n0_diag = _PARALLEL_STATE['n0_diag']
+    surviving_pb = _PARALLEL_STATE['surviving_pb']
+    n_gauge_qubits = _PARALLEL_STATE['n_gauge_qubits']
+    F = _PARALLEL_STATE['F']
+    G = _PARALLEL_STATE['G']
+    DIM = _PARALLEL_STATE['DIM']
+    expm_batch_size = _PARALLEL_STATE['expm_batch_size']
+    n_surv = len(surviving_pb)
+
+    # Build (DIM, n_surv) RHS B for this g.
+    B = _np.zeros((DIM, n_surv), dtype=complex)
+    for k, pb in enumerate(surviving_pb):
+        B[(pb << n_gauge_qubits) | g, k] = 1.0
+
+    partial = {t: 0.0 + 0.0j for t in times}
+    for t in times:
+        if t == 0.0:
+            E = n0_diag[:, None] * B
+        else:
+            E = _np.empty((DIM, n_surv), dtype=complex)
+            for b_start in range(0, n_surv, expm_batch_size):
+                b_end = min(b_start + expm_batch_size, n_surv)
+                B_batch = B[:, b_start:b_end]
+                C_batch = _expm_multiply(-1j * t * H_sparse, B_batch)
+                C_batch *= n0_diag[:, None]
+                E[:, b_start:b_end] = _expm_multiply(
+                    +1j * t * H_sparse, C_batch)
+                del C_batch
+
+        for (g_bot_i, W_psi_i) in configs_g_top:
+            partial_bt = E[g_bot_i::G, :]
+            O_sub_bot_top = _np.zeros((F, F), dtype=complex)
+            O_sub_bot_top[:, surviving_pb] = partial_bt
+            partial[t] += 0.5 * _np.trace(W_psi_i @ O_sub_bot_top)
+
+        for (g_top_i, W_psi_i) in configs_g_bot:
+            partial_tb = E[g_top_i::G, :]
+            O_sub_top_bot = _np.zeros((F, F), dtype=complex)
+            O_sub_top_bot[:, surviving_pb] = partial_tb
+            partial[t] += 0.5 * _np.sum(W_psi_i.conj() * O_sub_top_bot)
+
+        del E
+
+    return partial
+
+
+def accumulate_C_direct_slab_parallel(
+    geom: LatticeGeometry,
+    configs,
+    a_tau: float,
+    times,
+    H_sparse,
+    m_obs: float,
+    g_hop: float,
+    w_order: int = 1,
+    require_temporal_gauge: bool = True,
+    progress: bool = True,
+    n_workers: int = 4,
+    expm_batch_size: int = None,
+):
+    """Multi-process Phase 2+3 variant of accumulate_C_direct_slab.
+
+    Phase 1 (W_psi cache + slice config enumeration) is sequential and
+    inexpensive.  Phase 2+3 — building E[g, t] via sparse expm_multiply
+    and contracting against per-config W_psi — is embarrassingly parallel
+    across unique g values.  We dispatch one (g, contractions) task per
+    unique g to a multiprocessing.Pool with fork start method so workers
+    inherit H_sparse / n0_diag / etc. via copy-on-write (no per-task
+    pickling of the 400 MB sparse H).
+
+    Args mirror accumulate_C_direct_slab plus:
+        n_workers: number of parallel worker processes.  Each holds
+                   ~30 GB peak scipy expm workspace at V_3=8 3D k=128;
+                   tune to fit RAM.
+
+    Returns: same shape as accumulate_C_direct_slab.
+    """
+    import multiprocessing as _mp
+    import time as _time
+
+    V3 = geom.V_3
+    F = 1 << V3
+    n_gauge_qubits, _ = qc_layout_counts(geom)
+    G = 1 << n_gauge_qubits
+    DIM = F * G
+    if H_sparse.shape != (DIM, DIM):
+        raise ValueError(
+            f"H_sparse shape {H_sparse.shape} != ({DIM},{DIM}) expected.")
+    if w_order != 1:
+        raise NotImplementedError("parallel slab only supports w_order=1")
+
+    q_n0 = n_gauge_qubits
+
+    if geom.Lx == 2 and geom.Ly == 2 and geom.Lz == 1:
+        gauge_extractor = gauge_qc_bits_from_slice
+    else:
+        def gauge_extractor(U, t_slice):
+            return gauge_qc_bits_general(U, t_slice, geom)
+
+    idx_to_psi = _fock_index_to_psi_map(V3)
+    P = np.zeros((F, F), dtype=complex)
+    for li in range(F):
+        P[idx_to_psi[li], li] = 1.0
+
+    from transfer_matrix_kbc_trotterized import build_T_F_trotter
+    Lx, Ly, Lz = geom.Lx, geom.Ly, geom.Lz
+    n_y = Lx * (Ly - 1) * Lz
+    n_x = (Lx - 1) * Ly * Lz
+
+    if Lz == 1:
+        def decode_slice_bits(slice_bits):
+            U_y_slice = np.ones((Lx, Ly - 1), dtype=int)
+            U_x_slice = np.ones((Lx - 1, Ly), dtype=int)
+            for x in range(Lx):
+                for y in range(Ly - 1):
+                    if (slice_bits >> (x * (Ly - 1) + y)) & 1:
+                        U_y_slice[x, y] = -1
+            for x in range(Lx - 1):
+                for y in range(Ly):
+                    if (slice_bits >> (n_y + x * Ly + y)) & 1:
+                        U_x_slice[x, y] = -1
+            return U_x_slice, U_y_slice, None
+    else:
+        def decode_slice_bits(slice_bits):
+            U_y_slice = np.ones((Lx, Ly - 1, Lz), dtype=int)
+            U_x_slice = np.ones((Lx - 1, Ly, Lz), dtype=int)
+            U_z_slice = np.ones((Lx, Ly, Lz - 1), dtype=int)
+            for x in range(Lx):
+                for y in range(Ly - 1):
+                    for z in range(Lz):
+                        if (slice_bits >> ((x * (Ly - 1) + y) * Lz + z)) & 1:
+                            U_y_slice[x, y, z] = -1
+            for x in range(Lx - 1):
+                for y in range(Ly):
+                    for z in range(Lz):
+                        if (slice_bits >> (n_y + (x * Ly + y) * Lz + z)) & 1:
+                            U_x_slice[x, y, z] = -1
+            for x in range(Lx):
+                for y in range(Ly):
+                    for z in range(Lz - 1):
+                        pos = n_y + n_x + (x * Ly + y) * (Lz - 1) + z
+                        if (slice_bits >> pos) & 1:
+                            U_z_slice[x, y, z] = -1
+            return U_x_slice, U_y_slice, U_z_slice
+
+    # ----- Phase 1: T_F cache + W_psi list (serial; fast) -----
+    if progress:
+        print("  Phase 1: building W_psi via T_F slice cache...", flush=True)
+    t1 = _time.time()
+    config_slice_bits = []
+    config_g_top = []
+    config_g_bot = []
+    unique_g = set()
+    unique_slice_bits = set()
+    for U in configs:
+        if require_temporal_gauge:
+            assert (U.U_t == 1).all()
+        slice_bits_list = []
+        for t_slice in range(geom.N_E - 1):
+            sb = gauge_extractor(U, t_slice)
+            slice_bits_list.append(sb)
+            unique_slice_bits.add(sb)
+        config_slice_bits.append(slice_bits_list)
+        g_top = gauge_extractor(U, geom.N_E - 1)
+        g_bot = gauge_extractor(U, 0)
+        config_g_top.append(g_top)
+        config_g_bot.append(g_bot)
+        unique_g.add(g_top)
+        unique_g.add(g_bot)
+    n_configs = len(config_slice_bits)
+
+    T_F_cache = {}
+    for sb in unique_slice_bits:
+        U_x_slice, U_y_slice, U_z_slice = decode_slice_bits(sb)
+        T_F_cache[sb] = build_T_F_trotter(
+            geom, U_x_slice, U_y_slice, a_tau=a_tau, m=m_obs,
+            K_E=0.0, K_M=0.0, g_hop=g_hop, U_z_slice=U_z_slice)
+
+    config_W_psi = []
+    for slice_bits_list in config_slice_bits:
+        W = np.eye(F, dtype=complex)
+        for sb in slice_bits_list:
+            W = T_F_cache[sb] @ W
+        config_W_psi.append(P @ W @ P.T)
+    unique_g_list = sorted(unique_g)
+    if progress:
+        print(f"    Phase 1 done in {_time.time()-t1:.1f}s "
+              f"({n_configs} configs, {len(unique_g_list)} unique g, "
+              f"{len(unique_slice_bits)} unique slices).", flush=True)
+
+    # ----- Trace denominator (rare event at large n_gauge) -----
+    C_denom = 0.0
+    for i in range(n_configs):
+        if config_g_top[i] == config_g_bot[i]:
+            C_denom += np.trace(config_W_psi[i]).real
+
+    # ----- Phase 2+3 parallel: dispatch tasks per unique g -----
+    surviving_pb = np.array([pb for pb in range(F) if (pb & 1)],
+                            dtype=np.int64)
+    n_surv = len(surviving_pb)
+    n0_diag = ((np.arange(DIM, dtype=np.int64) >> q_n0) & 1).astype(complex)
+
+    if expm_batch_size is None:
+        max_k = max(1, int(3e9 / (30 * 16 * DIM)))
+        expm_batch_size = min(n_surv, max(1, max_k))
+    expm_batch_size = int(expm_batch_size)
+
+    # Group config refs by g (both as g_top and g_bot endpoints)
+    configs_by_g_top = {}
+    configs_by_g_bot = {}
+    for i in range(n_configs):
+        configs_by_g_top.setdefault(config_g_top[i], []).append(
+            (config_g_bot[i], config_W_psi[i]))
+        configs_by_g_bot.setdefault(config_g_bot[i], []).append(
+            (config_g_top[i], config_W_psi[i]))
+
+    tasks = [(g, list(times),
+              configs_by_g_top.get(g, []),
+              configs_by_g_bot.get(g, []))
+             for g in unique_g_list]
+
+    # Stash shared state in module global; workers inherit via fork.
+    _set_parallel_state(
+        H_sparse=H_sparse, n0_diag=n0_diag,
+        surviving_pb=surviving_pb, n_gauge_qubits=n_gauge_qubits,
+        F=F, G=G, DIM=DIM, expm_batch_size=expm_batch_size,
+    )
+
+    if progress:
+        print(f"  Phase 2+3 parallel: {len(tasks)} g-tasks across "
+              f"{n_workers} workers, batch={expm_batch_size}...", flush=True)
+    t23 = _time.time()
+
+    ctx = _mp.get_context('fork')
+    with ctx.Pool(n_workers) as pool:
+        partial_results = pool.map(_worker_phase23_one_g, tasks)
+
+    if progress:
+        print(f"    Phase 2+3 done in {_time.time()-t23:.1f}s "
+              f"({(_time.time()-t23) / max(len(tasks),1):.1f}s/g).", flush=True)
+
+    # Sum partial contributions
+    Trho_O = {t: 0.0 + 0.0j for t in times}
+    for partial in partial_results:
+        for t in times:
+            Trho_O[t] += partial[t]
+
+    if C_denom == 0.0:
+        import warnings as _w
+        _w.warn(
+            f"parallel slab C_denom = 0 after {n_configs} configs.  At "
+            f"n_gauge >= 10 this is rare-event-dominated.  Returning NaN "
+            f"C(t); use Trho_O[t]/Trho_O[t_ref] × C_Hutch(t_ref).")
+        C = {t: float('nan') for t in times}
+    else:
+        C = {t: Trho_O[t].real / C_denom for t in times}
+    return C, C_denom, Trho_O, n_configs
+
+
 def assemble_rho_dense(
     geom: LatticeGeometry,
     configs,

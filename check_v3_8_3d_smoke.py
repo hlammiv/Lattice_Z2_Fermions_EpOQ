@@ -39,8 +39,14 @@ cs.M_MASS = 0.5
 from action_z2_staggered import LatticeGeometry
 from action_z2_metropolis import run_metropolis
 from action_minkowski_stitch import qc_layout_counts
-from epoq_pipeline_direct_sampling import accumulate_C_direct_slab
+from epoq_pipeline_direct_sampling import (
+    accumulate_C_direct_slab,
+    accumulate_C_direct_slab_parallel,
+)
 from epoq_sparse_ed import compute_C_t_hutchinson
+
+
+N_WORKERS = 4   # parallel workers for Phase 2+3 (one per unique g, batched)
 
 
 LX, LY, LZ = 2, 2, 2
@@ -113,14 +119,16 @@ def main():
     print(f"  MC done in {t_mc:.0f}s, {len(configs)} configs recorded, "
           f"accept rate {result.accept_rate:.3f}", flush=True)
 
-    # --- Slab accumulator ---
-    print(f"\nSlab accumulator (streaming Phase 2+3) ...", flush=True)
+    # --- Slab accumulator (parallel Phase 2+3) ---
+    print(f"\nSlab accumulator (parallel Phase 2+3, {N_WORKERS} workers) ...",
+          flush=True)
     t0 = time.time()
-    C_lat_native, denom, num, _ = accumulate_C_direct_slab(
+    C_lat_native, denom, num, _ = accumulate_C_direct_slab_parallel(
         geom_mc, configs, a_tau=A_TAU, times=TIMES,
         H_sparse=H_sparse,
         m_obs=M_HAM, g_hop=G_HOP, w_order=W_ORDER,
-        progress=True, progress_every=16,
+        expm_batch_size=128, n_workers=N_WORKERS,
+        progress=True,
     )
     t_slab = time.time() - t0
     print(f"\n  Slab done in {t_slab:.0f}s ({t_slab/60:.1f} min)", flush=True)
